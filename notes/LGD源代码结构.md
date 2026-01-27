@@ -2,7 +2,7 @@
 
 数据集结构：
 
-Grasp-Anything/  # 对应 --dataset-path 指定的路径 
+Grasp-Anything/   
 
 ├── image/                # 存放 RGB 图像 
 
@@ -20,9 +20,9 @@ Grasp-Anything/  # 对应 --dataset-path 指定的路径
 
 │   └── *.pt         # 抓取标注文件（如：xxx_0.pt） 
 
-└── grasp-anything++/     # 对应 --add-file-path 指定的路径（示例中为 data/grasp-anything++/seen）    
+└── Grasp-Anything++/     	
 
-​	└── seen/        
+​		└── part_mask/        # 存放部位级掩码文件
 
 ​		├── grasp_label_positive/  # 存放部位级正样本抓取数据       
 
@@ -6315,56 +6315,58 @@ class GraspAnythingDataset(LanguageGraspDatasetBase):
 import glob
 import os
 import re
-
 import pickle
 import torch
+import numpy as np
 
 from utils.dataset_processing import grasp, image, mask
 from .language_grasp_data import LanguageGraspDatasetBase
 
-
 class GraspAnywhereDataset(LanguageGraspDatasetBase):
     """
-    Dataset wrapper for the Grasp-Anything dataset.
+    Dataset wrapper for the Grasp-Anything dataset (Part-Level with Instructions).
     """
 
     def __init__(self, file_path, ds_rotate=0, **kwargs):
         """
         :param file_path: Grasp-Anything 数据集的主目录.
-        :param ds_rotate: 数据集列表旋转比例（用于简单的交叉验证划分）
-        :param kwargs: 其他关键字参数（包含 add_file_path, seen 等）
+        :param ds_rotate: 数据集列表旋转比例
+        :param kwargs: 其他关键字参数
         """
         super(GraspAnywhereDataset, self).__init__(**kwargs)
 
         addition_file_path = kwargs["add_file_path"]
 
+        # 1. 加载部位级抓取标签 (Part-level labels)
         self.grasp_files = glob.glob(os.path.join(addition_file_path, 'grasp_label_positive', '*.pt'))
-        self.prompt_files = glob.glob(os.path.join(file_path, 'scene_description', '*.pkl'))
+        
+        # 2. 场景描述文件 (Scene context)
         self.prompt_dir = os.path.join(file_path, 'scene_description')
+        
+        # 3. 抓取指令目录 (Grasp Instructions - 您的目标 Query)
         self.instruction_dir = os.path.join(addition_file_path, 'grasp_instructions')
+        
         self.rgb_files = glob.glob(os.path.join(file_path, 'image', '*.jpg'))
         self.rgb_dir = os.path.join(file_path, 'image')
         self.mask_files = glob.glob(os.path.join(file_path, 'mask', '*.npy'))
 
+        # 过滤数据集 (Seen/Unseen Split)
+        # 注意：Split文件通常保存的是物体级ID (scene_objID)，而文件名是 scene_objID_partID.pt
+        # 所以这里的切片 [:-5] 假设文件名格式严格为 ..._X.pt (最后一位是单位数 partID)
+        # 如果 partID 超过 9，建议使用 split('_') 逻辑处理
         if kwargs["seen"]:
-            # 如果参数指定 seen=True (已知物体模式)
-            with open(os.path.join('split/grasp-anything++/test/seen.obj'), 'rb') as f:
-                idxs = pickle.load(f)# 加载 seen.obj 中的 ID 列表
-            # 过滤 grasp_files：只保留文件名（去掉最后5位字符后）存在于 idxs 列表中的文件
+            with open(os.path.join('split/grasp-anything++/train/seen.obj'), 'rb') as f:
+                idxs = pickle.load(f)
             self.grasp_files = list(filter(lambda x: x.split('/')[-1][:-5] in idxs, self.grasp_files))
         else:
-            with open(os.path.join('split/grasp-anything++/test/unseen.obj'), 'rb') as f:
+            with open(os.path.join('split/grasp-anything++/test/seen.obj'), 'rb') as f:
                 idxs = pickle.load(f)
-
             self.grasp_files = list(filter(lambda x: x.split('/')[-1][:-5] in idxs, self.grasp_files))
 
-
         self.grasp_files.sort()
-        self.prompt_files.sort()
         self.rgb_files.sort()
         self.mask_files.sort()
 
-        # 抓取物体总数量
         self.length = len(self.grasp_files)
 
         if self.length == 0:
@@ -6373,8 +6375,7 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         if ds_rotate:
             self.grasp_files = self.grasp_files[int(self.length * ds_rotate):] + self.grasp_files[
                                                                                  :int(self.length * ds_rotate)]
-            
-    # 
+
     def _get_crop_attrs(self, idx):
         gtbbs = grasp.GraspRectangles.load_from_grasp_anything_file(self.grasp_files[idx])
         center = gtbbs.center
@@ -6382,24 +6383,17 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         top = max(0, min(center[0] - self.output_size // 2, 416 - self.output_size))
         return center, left, top
 
-    # 
     def get_gtbb(self, idx, rot=0, zoom=1.0):       
-        # Jacquard try
+        # 加载部位级抓取矩形
         gtbbs = grasp.GraspRectangles.load_from_grasp_anything_file(self.grasp_files[idx], scale=self.output_size / 416.0)
-
         c = self.output_size // 2
         gtbbs.rotate(rot, (c, c))
         gtbbs.zoom(zoom, (c, c))
-
-        # Cornell try
-        # gtbbs = grasp.GraspRectangles.load_from_grasp_anything_file(self.grasp_files[idx])
-        # center, left, top = self._get_crop_attrs(idx)
-        # gtbbs.rotate(rot, center)
-        # gtbbs.offset((-top, -left))
-        # gtbbs.zoom(zoom, (self.output_size // 2, self.output_size // 2))
         return gtbbs
 
     def get_depth(self, idx, rot=0, zoom=1.0):
+        # 假设有 self.depth_files，如果没有需在 init 中添加。这里沿用原逻辑。
+        # 如果不使用深度图，此函数不会被调用。
         depth_img = image.DepthImage.from_tiff(self.depth_files[idx])
         center, left, top = self._get_crop_attrs(idx)
         depth_img.rotate(rot, center)
@@ -6409,17 +6403,25 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
         depth_img.resize((self.output_size, self.output_size))
         return depth_img.img
 
-    # 找到对应的 jpg 文件 -> 读取 -> 旋转/缩放增强 -> Resize 到 224x224 -> 转为 PyTorch 格式 (CHW)
     def get_rgb(self, idx, rot=0, zoom=1.0, normalise=True):
-        mask_file = self.grasp_files[idx].replace("positive_grasp", "mask").replace(".pt", ".npy")
-        # mask_img = mask.Mask.from_file(mask_file)
-        rgb_file = re.sub(r"_\d{1}_\d{1}\.pt", ".jpg", self.grasp_files[idx])
-        rgb_file = rgb_file.split('/')[-1]
-        rgb_file = os.path.join(self.rgb_dir, rgb_file)
-        rgb_img = image.Image.from_file(rgb_file)
-        # rgb_img = image.Image.mask_out_image(rgb_img, mask_img)
+        # 更加鲁棒的文件名解析方式
+        # 抓取文件格式: scene_objID_partID.pt
+        grasp_file_name = self.grasp_files[idx].split('/')[-1]
+        
+        # 移除最后的 _objID_partID.pt 得到图片名
+        # 逻辑：以 '_' 分割，去掉最后两部分 (obj_id, part_id)，然后重新组合
+        parts = grasp_file_name.split('.')[0].split('_')
+        # 假设场景名本身不含下划线，或者处理逻辑如下：
+        if len(parts) >= 3:
+            rgb_base_name = "_".join(parts[:-2]) # 丢弃最后两部分
+        else:
+            # Fallback (防止文件名异常)
+            rgb_base_name = parts[0]
 
-        # Jacquard try
+        rgb_file = os.path.join(self.rgb_dir, rgb_base_name + ".jpg")
+
+        rgb_img = image.Image.from_file(rgb_file)
+
         rgb_img.rotate(rot)
         rgb_img.zoom(zoom)
         rgb_img.resize((self.output_size, self.output_size))
@@ -6428,51 +6430,58 @@ class GraspAnywhereDataset(LanguageGraspDatasetBase):
             rgb_img.img = rgb_img.img.transpose((2, 0, 1))
         return rgb_img.img
 
-        # Cornell try
-        # center, left, top = self._get_crop_attrs(idx)
-        # rgb_img.rotate(rot, center)
-        # rgb_img.crop((top, left), (min(480, top + self.output_size), min(640, left + self.output_size)))
-        # rgb_img.zoom(zoom)
-        # rgb_img.resize((self.output_size, self.output_size))
-        # if normalise:
-        #     rgb_img.normalise()
-        #     rgb_img.img = rgb_img.img.transpose((2, 0, 1))
-        # return rgb_img.img
-
-    
     def get_prompts(self, idx):
-        # 1. 获取文件名
-        grasp_file = self.grasp_files[idx].split('/')[-1]
-        # 例如：self.grasp_files[idx] 是 ".../scene01_5_0.pt"
-        # split('/')[-1] 拿到 "scene01_5_0.pt"
+        """
+        修改重点：加载 grasp_instructions 中的具体指令。
+        """
+        # 1. 获取抓取文件名 (例如: scene01_5_0.pt)
+        grasp_file_name = self.grasp_files[idx].split('/')[-1]
 
-        # 2. 拆分文件名
-        prompt_file, obj_id, part_id = grasp_file.split('_')
-        # 这里假设文件名格式严格为： "场景名_物体ID_部件ID.pt"
-        # 例如 "scene01_5_0.pt" 被拆分为：
-        # prompt_file = "scene01" (场景对应的文件名)
-        # obj_id = "5"            (物体索引)
-        # part_id = "0.pt"        (抓取/部件索引)
+        # 2. 构建指令文件路径
+        # 指令文件名通常与抓取文件名一致，只是后缀为 .pkl
+        instruction_file_name = grasp_file_name.replace('.pt', '.pkl')
+        instruction_path = os.path.join(self.instruction_dir, instruction_file_name)
 
-        # 3. 构建指令文件路径 (但这部分后来没用)
-        instruction_file = grasp_file.split('.')[0]
-        instruction_file += '.pkl'
-        instruction_file = os.path.join(self.instruction_dir, instruction_file)
+        # 3. 加载具体的抓取指令 (Query)
+        # 假设 pkl 文件中直接存储了指令字符串，或者是一个包含字符串的列表
+        query_text = ""
+        try:
+            with open(instruction_path, 'rb') as f:
+                content = pickle.load(f)
+                # 根据数据集实际情况处理 content
+                # 常见情况：content 就是字符串 "Pick up the apple by the stem"
+                if isinstance(content, str):
+                    query_text = content
+                elif isinstance(content, list) or isinstance(content, tuple):
+                    query_text = str(content[0])
+                else:
+                    query_text = str(content)
+        except Exception as e:
+            print(f"Warning: Failed to load instruction for {grasp_file_name}: {e}")
+            query_text = "grasp object" # Fallback
 
-        # 4. 构建 Prompt 文件路径 (这是真正用到的)
-        prompt_file += '.pkl'# "scene01" -> "scene01.pkl"
-        # 拼接完整路径，例如：".../scene_description/scene01.pkl"
-        prompt_file = os.path.join(self.prompt_dir, prompt_file)
-        obj_id = int(obj_id)
-        part_id = int(part_id.split('.')[0])
+        # 4. (可选) 加载场景描述作为 Prompt 上下文
+        # 如果模型需要 prompt 和 query 两个输入，prompt 可以是场景描述，query 是具体指令
+        parts = grasp_file_name.split('.')[0].split('_')
+        prompt_file_base = "_".join(parts[:-2]) # scene01
+        prompt_path = os.path.join(self.prompt_dir, prompt_file_base + '.pkl')
 
-        with open(prompt_file, 'rb') as f:
-            x = pickle.load(f)
-            prompt, queries = x
-            # ('A small green apple and a yellow rubber duck sitting on a wooden table', ['apple', 'duck'])
-        
-        # 返回场景描述以及obj_id对应的物体
-        return prompt, queries[obj_id]
+        prompt_text = ""
+        try:
+            with open(prompt_path, 'rb') as f:
+                val = pickle.load(f)
+                # 原始格式通常是 (description, object_list)
+                if isinstance(val, tuple) or isinstance(val, list):
+                    prompt_text = val[0] # 获取场景描述
+                else:
+                    prompt_text = str(val)
+        except:
+            prompt_text = "Scene containing objects."
+
+        # 返回:
+        # prompt: 场景描述 (Context)
+        # query:  具体部位抓取指令 (Target)
+        return prompt_text, query_text
 ```
 
 ### grasp_data.py
@@ -8039,3 +8048,6 @@ if __name__ == '__main__':
     run()
 ```
 
+
+
+python train_network.py --network grconvnet --dataset grasp-anywhere --dataset-path /home/wjj2080/Datasets/Grasp-Anything  --add-file-path /home/wjj2080/Datasets/Grasp-Anything/Grasp-Anything++  --seen 1 --epochs 50  --batch-size 8 --description training_grconvnet_base --use-depth 0

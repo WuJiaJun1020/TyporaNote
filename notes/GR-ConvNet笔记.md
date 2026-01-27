@@ -25,6 +25,10 @@ Example for Cornell dataset:
 python train_network.py --dataset cornell --dataset-path /home/wjj/GG-CNN/ggcnn/archive --description training_cornell
 ```
 
+```
+python train_network.py --dataset cornell --dataset-path /home/wjj4090/Datasets/cornell --description training_cornell
+```
+
 Example for Jacquard dataset:
 提花数据集示例：
 
@@ -54,3 +58,39 @@ Example for Jacquard dataset:
 ```
 python evaluate.py --network <Path to Trained Network> --dataset jacquard --dataset-path <Path to Dataset> --iou-eval --use-dropout 0 --input-size 300
 ```
+
+
+
+# 改造GR-convnet-wjj：
+
+## 1.修改数据集的划分
+
+把jacquard从使用整个数据集改成了seen和unseen的划分方式
+
+训练指令：
+
+```
+python train_network.py --dataset jacquard --dataset-path /home/wjj4090/Datasets/Jacquard --descripti
+on training_jacquard --use-dropout 0 --input-size 224 --seen 1
+```
+
+## 2.加入对graspanything数据集的支持
+
+从LGD代码里面把grasp_anything_data.py和language_grasp_data.py复制过来
+
+```
+python train_network.py --dataset grasp-anything --dataset-path /home/wjj4090/Datasets/Grasp-Anything --description training_graspanything --use-dropout 0 --use-depth 0 --input-size 224
+```
+
+
+
+# 1.SE-ResUNet
+
+https://github.com/BIT-robot-group/SE-ResUNet
+
+cornell:98.2 jacquard:95.7
+
+```
+python train_network.py --dataset cornell --dataset-path /home/wjj4090/Datasets/Jacquard --description training_cornell
+```
+

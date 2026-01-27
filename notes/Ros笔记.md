@@ -1857,3 +1857,60 @@ catkin_make
 电子书链接：https://dcd.cmpkgs.com/ebook/web/index.html#/pdfReader?SkuExternalId=P00109-01-784BF859556FC8677532853AB98312A7AD3227880A19F1569906E089B38434CB-Pdf&Extra=qEbbiKvTB-FwgKrzAi0f6H2MLnwptRFeYwpPEF5VYKNfnzO2XpqXXt_U4wNrqHljQyFHDEZwzoHYQg5JNri32hEAx9u4UgjPfcKBiupAfl1q6wLxxJoiVNfkGS166SL4rK-ihZeTt4InKiw-AragRHTvXPKK1M9IGI6MJIcHz0lheCK952uUGN35tYwIC6yF4LaVWcQXXyARmrdq31Q1nvOIc7bVYYQGrG5fFioT9kTg7X6ZOOLEv_-NS9rSyDMtdFbzyDr1JkqxX6tJIDEqlA%3D%3D
 
 代码链接：https://github.com/PacktPublishing/Mastering-ROS-for-Robotics-Programming-Third-edition
+
+
+
+# UR3机械臂驱动
+
+## 1.创建工作空间
+
+```
+mkdir -p ~/ros_ur3/src
+cd ~/ros_ur3
+```
+
+## 2.下载并配置
+
+```
+# 下载下面三个链接的东西，解压放到src里面
+#-----------------------------------------------------
+https://github.com/UniversalRobots/Universal_Robots_ROS_Driver.git src/Universal_Robots_ROS_Driver
+
+https://github.com/UniversalRobots/Universal_Robots_Client_Library
+
+https://github.com/ros-industrial/universal_robot/tree/noetic-devel
+#-----------------------------------------------------
+
+sudo apt-get install ros-noetic-scaled-joint-trajectory-controller
+sudo apt-get install ros-noetic-twist-controller
+sudo apt-get install ros-noetic-industrial-robot-status-controller
+sudo apt-get install ros-noetic-cartesian-trajectory-controller
+
+rosdep install --from-paths src --ignore-src -y
+
+catkin_make_isolated --install
+
+source ~/ros_ur3/install_isolated/setup.bash
+# 永久添加到bashrc
+# gedit ~/.bashrc
+
+# 测试仿真
+方式一：
+roslaunch ur3e_moveit_config demo.launch
+方式二：
+roslaunch ur_gazebo ur3e_bringup.launch
+roslaunch ur3e_moveit_config moveit_planning_execution.launch sim:=true
+roslaunch ur3e_moveit_config moveit_rviz.launch
+
+# 连接真实机械臂
+# 第一步，机械臂校准，生成my_ur3e_calibration.yaml校准文件
+roslaunch ur_calibration calibration_correction.launch robot_ip:=192.168.1.102 
+target_filename:="${HOME}/my_ur3e_calibration.yaml"
+# 第二步，启动并加载校准文件
+roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.1.102 kinematics_config:="${HOME}/my_ur3e_calibration.yaml"
+# 第三步，启动moveit规划
+roslaunch ur3e_moveit_config moveit_planning_execution.launch
+# 第四步，启动rviz
+roslaunch ur3e_moveit_config moveit_rviz.launch
+```
+

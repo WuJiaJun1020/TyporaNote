@@ -1249,7 +1249,7 @@ class BaseGraspDataset(torch.utils.data.Dataset):
         if self.include_prompt:
             prompt = self.get_prompt(idx)
             
-        ocid = True
+        ocid = False# 这里修改了，本来是True
         if ocid:
             pos_img, ang_img, width_img = bbs.draw((self.crop_size, self.crop_size))
             pos_img = cv2.resize(pos_img, (self.output_size, self.output_size), interpolation=cv2.INTER_NEAREST)
@@ -1356,25 +1356,30 @@ from .utils import image_utils as iu
 
 class GraspAnythingDataset(BaseGraspDataset):
     """
-    Dataset wrapper for the Grasp-Anything dataset.
+    Grasp-Anything 数据集的数据集包装器.
     """
 
-    def __init__(self, root, start=0.0, end=1.0,  ds_rotate=0, **kwargs):
+    def __init__(self, root, ds_rotate=0, **kwargs):
         """
-        :param file_path: Grasp-Anything Dataset directory.
-        :param ds_rotate: If splitting the dataset, rotate the list of items by this fraction first
-        :param kwargs: kwargs for GraspDatasetBase
+        :param file_path: Grasp-Anything 数据集目录.
+        :param ds_rotate: 如果拆分数据集，先将项目列表旋转该比例
+        :param kwargs: 传递给 GraspDatasetBase 的关键字参数
         """
         super(GraspAnythingDataset, self).__init__(**kwargs)
 
+        # 1. 获取所有抓取标签文件
+        # root 是数据集根目录，这里查找 grasp_label_positive 文件夹下的所有 .pt 文件
         grasp_files = glob.glob(os.path.join(root, 'grasp_label_positive', '*.pt'))
 
-
+        # 2. 处理 "Seen" (已知物体) 模式
         if self.seen:
+            # 加载定义的 seen 数据集索引文件
             with open(os.path.join('split/grasp-anything/seen.obj'), 'rb') as f:
                 idxs = pickle.load(f)
-            
+                
+            # 过滤：只保留在 idxs 列表中的文件，取出在seen.obj中描述的且存在的部分
             grasp_files = list(filter(lambda x: x.split('/')[-1].split('.')[0] in idxs, grasp_files))
+            # 90% 用于训练，10% 用于测试（Seen Split）
             split = int(np.floor(0.9 * len(grasp_files)))
             if self.train:
                 self.grasp_files = grasp_files[:split]
@@ -1382,16 +1387,17 @@ class GraspAnythingDataset(BaseGraspDataset):
             else:
                 self.grasp_files = grasp_files[split:]
         
-        
+        # 3. 处理 "Unseen" (未知物体) 模式
         else:
+            # 加载 unseen 索引文件
             with open(os.path.join('split/grasp-anything/unseen.obj'), 'rb') as f:
                 idxs = pickle.load(f)
-
+            # 过滤只保留 unseen 的文件
             self.grasp_files = list(filter(lambda x: x.split('/')[-1].split('.')[0] in idxs, grasp_files))
 
-
+        # 4. 排序与基础处理
         l = len(self.grasp_files)
-
+        # 排序保证每次加载顺序一致
         self.grasp_files.sort()
    
         # self.grasp_files = self.grasp_files[int(l*start):int(l*end)]
@@ -1401,42 +1407,64 @@ class GraspAnythingDataset(BaseGraspDataset):
         if self.length == 0:
             raise FileNotFoundError('No dataset files found. Check path: {}'.format(root))
 
+        # 5. 数据集旋转 (Dataset Rotation)
+        # 这不是图像旋转，而是将文件列表的顺序进行循环移位。
+        # 例如 [A, B, C, D] -> ds_rotate=0.5 -> [C, D, A, B]。通常用于交叉验证。
         if ds_rotate:
             self.grasp_files = self.grasp_files[int(self.length * ds_rotate):] + self.grasp_files[
                                                                                  :int(self.length * ds_rotate)]
-
-    def get_gtbb(self, idx, rot=0, zoom=1.0):       
+    # 负责加载对应的抓取矩形框（Ground Truth Bounding Boxes）
+    def get_gtbb(self, idx, rot=0, zoom=1.0): 
+        # 1. 加载抓取文件
+        # 从 .pt 文件中读取抓取矩形。
+        # scale=self.output_size / 416.0：Grasp-Anything 原始数据可能是 416x416，
+        # 这里需要缩放到模型需要的 output_size (通常是 1024)。      
         gtbbs = gu.GraspRectangles.load_from_grasp_anything_file(self.grasp_files[idx], scale=self.output_size / 416.0)
 
+        # 2. 数据增强 (Augmentation)
         c = self.output_size // 2
-        gtbbs.rotate(rot, (c, c))
-        gtbbs.zoom(zoom, (c, c))
+        gtbbs.rotate(rot, (c, c))# 围绕中心旋转抓取框
+        gtbbs.zoom(zoom, (c, c))# 以中心为原点缩放抓取框
         # gtbbs.resize(self.crop_size, self.output_size)
    
         return gtbbs
 
-
+    # 根据抓取文件的路径，推导出 RGB 图像的路径并加载处理
     def get_rgb(self, idx, rot=0, zoom=1.0, normalise=True):
+        # 1. 路径转换
+        # 假设 grasp file 是 ".../grasp_label_positive/scene_000_1.pt"
+        # 这里用正则去掉后缀数字 (_\d+\.pt -> .jpg)，并替换文件夹名。
+        # 目的：找到对应的 RGB 图片路径 ".../image/scene_000.jpg"
         rgb_file = re.sub(r"_\d+\.pt", ".jpg", self.grasp_files[idx])
         rgb_file = rgb_file.replace("grasp_label_positive", "image")
+
+        # 2. 加载图像
         rgb_img = iu.Image.from_file(rgb_file)
         # rgb_img = image.Image.mask_out_image(rgb_img, mask_img)
 
-        # Jacquard try
+        # 3. 数据增强 (与抓取框同步变换)
         rgb_img.rotate(rot)
         rgb_img.zoom(zoom)
-        rgb_img.resize((self.output_size, self.output_size))
-        rgb_img.img = rgb_img.img[...,::-1]
+        rgb_img.resize((self.output_size, self.output_size))# 调整到模型输入尺寸 (如 1024x1024)
         
+        # 4. 颜色通道转换
+        # [...,::-1] 通常是将 BGR 转换为 RGB (OpenCV 默认读入是 BGR)
+        rgb_img.img = rgb_img.img[...,::-1]
+
+        # 5. 归一化与维度变换
         if normalise:
             rgb_img.normalise()
-            rgb_img.img = rgb_img.img.transpose((2, 0, 1))
+            rgb_img.img = rgb_img.img.transpose((2, 0, 1))# 从 (H, W, C) 转换为 PyTorch 需要的 (C, H, W)
         return rgb_img.img
     
-    
+    # 加载对象的分割掩码（Mask），用于辅助模型聚焦于物体区域
     def get_mask(self, idx, rot=0, zoom=1.0):
+        # 1. 路径转换
+        # 替换文件夹名 grasp_label_positive -> mask，后缀 .pt -> .npy
         mask_file = self.grasp_files[idx].replace("grasp_label_positive", "mask").replace(".pt", ".npy")
+        # 2. 加载 .npy 文件作为掩码
         mask_image = iu.Mask.from_npy_file(mask_file)
+        # 3. 数据增强 (必须与 RGB 和 GTBB 保持一致)
         mask_image.rotate(rot)
         mask_image.zoom(zoom)
         mask_image.resize((self.output_size, self.output_size))
@@ -1468,7 +1496,7 @@ class JacquardDataset(BaseGraspDataset):
     """
     Dataset wrapper for the Jacquard dataset.
     """
-    def __init__(self, root, start=0.0, end=1.0, ds_rotate=0, **kwargs):
+    def __init__(self, root, ds_rotate=0, **kwargs):
         """
         :param file_path: Jacquard Dataset directory.
         :param start: If splitting the dataset, start at this fraction [0,1]
@@ -1578,6 +1606,7 @@ class JacquardDataset(BaseGraspDataset):
         return '_'.join(self.grasp_files[idx].split(os.sep)[-1].split('_')[:-1])
 
 
+
 ```
 
 ## 4.grasp_anything_plus_data.py（手动新增）
@@ -1603,7 +1632,7 @@ class GraspAnythingPlusPlusDataset(BaseGraspDataset):
     支持读取 RGB、Mask、抓取标签以及语言提示（Language Prompts）。
     """
 
-    def __init__(self, root, start=0.0, end=1.0,  ds_rotate=0, **kwargs):
+    def __init__(self, root, ds_rotate=0, **kwargs):
 
         super(GraspAnythingPlusPlusDataset, self).__init__(**kwargs)
 
@@ -1703,7 +1732,7 @@ class GraspAnythingPlusPlusDataset(BaseGraspDataset):
         # root/grasp_label_positive/image01_3.pt
         # prompt_file 变成：root/scene_description/image01
         # obj_id (临时) 变成：3.pt
-        prompt_file, obj_id = self.grasp_files[idx].replace("grasp_label_positive", "scene_description").split('_')
+        prompt_file, obj_id = self.grasp_files[idx].replace("grasp_label_positive", "scene_description").rsplit('_', 1)
         prompt_file += '.pkl'# root/scene_description/image01.pkl
         obj_id = int(obj_id.split('.')[0])# 3
 
@@ -1717,117 +1746,7 @@ class GraspAnythingPlusPlusDataset(BaseGraspDataset):
 ## 5.grasp_anything_part_data.py
 
 ```
-import glob
-import os
-import re
-import pickle
-import torch
-import numpy as np
-from .base_grasp_data import BaseGraspDataset
-from .utils import grasp_utils as gu
-from .utils import image_utils as iu
 
-class GraspAnythingPartDataset(BaseGraspDataset):
-    """
-    针对 Grasp-Anything++ 部位级抓取的数据集加载器。
-    读取 Grasp Instructions 和 Part-level Grasp Labels。
-    """
-
-    def __init__(self, root, start=0.0, end=1.0, ds_rotate=0, **kwargs):
-        super(GraspAnythingPartDataset, self).__init__(**kwargs)
-
-        self.root = root
-        # 确定子目录是 seen 还是 unseen
-        self.subset = "seen" if self.seen else "unseen"
-        
-        # 构造抓取标签的基础路径: root/grasp-anything++/seen/grasp_label_positive
-        label_path = os.path.join(root, 'grasp-anything++', self.subset, 'grasp_label_positive')
-        
-        # 获取所有 .pt 文件 (格式如: xxxxx_0_0.pt)
-        grasp_files = glob.glob(os.path.join(label_path, '*.pt'))
-        grasp_files.sort()
-
-        # 根据 seen/unseen 的 split 文件进行过滤 (如果需要严格按照官方 split)
-        # 注意：官方 split obj 文件里存的通常是物体 ID (xxxxx_0)，而这里的文件是部位 ID (xxxxx_0_0)
-        # 这里为了简化，假设直接加载文件夹内的文件。如果需要过滤，需解析文件名匹配 obj ID。
-        
-        # 简单的 split 逻辑 (train/val)
-        split = int(np.floor(0.9 * len(grasp_files)))
-        if self.train:
-            self.grasp_files = grasp_files[:split]
-        else:
-            self.grasp_files = grasp_files[split:]
-
-        self.length = len(self.grasp_files)
-        if self.length == 0:
-            raise FileNotFoundError(f'No dataset files found in {label_path}')
-
-    def get_gtbb(self, idx, rot=0, zoom=1.0):
-        # 加载部位级抓取框
-        gtbbs = gu.GraspRectangles.load_from_grasp_anything_file(self.grasp_files[idx], scale=self.output_size / 416.0)
-        c = self.output_size // 2
-        gtbbs.rotate(rot, (c, c))
-        gtbbs.zoom(zoom, (c, c))
-        return gtbbs
-
-    def get_rgb(self, idx, rot=0, zoom=1.0, normalise=True):
-        # 路径转换逻辑：
-        # 当前: root/grasp-anything++/seen/grasp_label_positive/xxxxx_0_0.pt
-        # 目标: root/image/xxxxx.jpg
-        
-        # 1. 获取文件名 xxxxx_0_0.pt
-        filename = os.path.basename(self.grasp_files[idx])
-        
-        # 2. 正则替换：去掉 _数字_数字.pt，保留 xxxxx
-        # 假设 ID 是长字符串，后面接 _0_0.pt
-        img_name = re.sub(r"_\d+_\d+\.pt$", ".jpg", filename)
-        
-        # 3. 拼接 image 路径
-        rgb_file = os.path.join(self.root, 'image', img_name)
-
-        rgb_img = iu.Image.from_file(rgb_file)
-        rgb_img.rotate(rot)
-        rgb_img.zoom(zoom)
-        rgb_img.resize((self.output_size, self.output_size))
-        rgb_img.img = rgb_img.img[...,::-1] # BGR to RGB
-        
-        if normalise:
-            rgb_img.normalise()
-            rgb_img.img = rgb_img.img.transpose((2, 0, 1))
-        return rgb_img.img
-
-    def get_mask(self, idx, rot=0, zoom=1.0):
-        # 假设 part_mask 在 root/grasp-anything++/seen/mask/xxxxx_0_0.npy
-        # 或者 root/grasp-anything++/seen/part_mask/xxxxx_0_0.npy
-        # 这里根据你提供的文件名 xxxxx_0_0.npy 推断
-        
-        # 替换路径中的文件夹名和扩展名
-        mask_file = self.grasp_files[idx].replace("grasp_label_positive", "mask").replace(".pt", ".npy")
-        
-        # 如果 mask 文件夹不在 seen 下，而是在 root/mask 下，则需要像 get_rgb 那样处理路径
-        # 根据你的描述 "part_mask文件名: xxxxx_0_0.npy"，如果它们和 label 在同一层级结构下：
-        if not os.path.exists(mask_file):
-             # 尝试 fallback 到 root/mask (如果是整体 mask，但这里我们需要部位 mask)
-             # 如果部位 mask 不存在，可能需要检查路径配置
-             pass
-
-        mask_image = iu.Mask.from_npy_file(mask_file)
-        mask_image.rotate(rot)
-        mask_image.zoom(zoom)
-        mask_image.resize((self.output_size, self.output_size))
-        return mask_image.img
-
-    def get_prompt(self, idx):
-        # 路径转换：
-        # 当前: .../grasp_label_positive/xxxxx_0_0.pt
-        # 目标: .../grasp_instructions/xxxxx_0_0.pkl
-        prompt_file = self.grasp_files[idx].replace("grasp_label_positive", "grasp_instructions").replace(".pt", ".pkl")
-        
-        with open(prompt_file, 'rb') as f:
-            # pkl 内容是字符串: 'Pick up apple by its skin.'
-            instruction = pickle.load(f)
-            
-        return instruction
 ```
 
 
@@ -4125,387 +4044,122 @@ def masks_noise(masks):
 
 ## 4.planar_grasp_sam_language.py(手动新增)
 
-用scene_discription中的物品名称做提示，然后根据这个提示做抓取（目前只有语言提示，没有融合点提示）
-
-```
-import os
-import time
-import argparse
-import warnings
-
-warnings.filterwarnings(action='ignore')
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-
-import torch
-import torch.nn.functional as F
-
-from data.jacquard_data import JacquardDataset
-from data.grasp_anything_data import GraspAnythingDataset
-from data.grasp_anything_plus_data import GraspAnythingPlusPlusDataset
-from model.planar_grasp_sam_language import PlanarGraspSAM
-from utils.utils import TrainProgress
-from skimage.filters import gaussian
-from data.utils.grasp_utils import *
-
-
-# 权重过滤函数
-def get_clean_state_dict(model):
-    """
-    获取模型的 state_dict，但剔除 CLIP/Text Encoder 相关的权重。
-    通常这些权重是冻结的，且体积很大，没必要重复保存。
-    """
-    raw_state_dict = model.state_dict()
-    clean_state_dict = {}
-    
-    # 这里定义的关键字用于识别不需要保存的层
-    # 根据具体的模型定义，关键词可能是 'clip_model', 'text_encoder', 'bert' 等
-    ignore_keywords = ['clip_model', 'text_encoder', 'clip.'] 
-
-    for k, v in raw_state_dict.items():
-        # 检查参数名中是否包含任何忽略关键词
-        should_ignore = False
-        for keyword in ignore_keywords:
-            if keyword in k:
-                should_ignore = True
-                break
-        
-        if not should_ignore:
-            clean_state_dict[k] = v
-            
-    return clean_state_dict
-
-# ... (calculate_iou_match 保持不变) ...
-def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, grasp_width=None):
-    if not isinstance(ground_truth_bbs, GraspRectangles):
-        gt_bbs = GraspRectangles.load_from_array(ground_truth_bbs)
-    else:
-        gt_bbs = ground_truth_bbs
-
-    gs = detect_grasps(grasp_q, grasp_angle, width_img=grasp_width, no_grasps=no_grasps)
-    for g in gs:
-        if g.max_iou(gt_bbs) > 0.25:
-            return True
-    else:
-        return False
-
-# ... (post_process_output 保持不变) ...
-def post_process_output(q_img, cos_img, sin_img, width_img):
-    if len(q_img.shape) == 3:
-        q_img = F.interpolate(q_img.unsqueeze(0), size=(1024, 1024))[0]
-        cos_img = F.interpolate(cos_img.unsqueeze(0), size=(1024, 1024))[0]
-        sin_img = F.interpolate(sin_img.unsqueeze(0), size=(1024, 1024))[0]
-        width_img = F.interpolate(width_img.unsqueeze(0), size=(1024, 1024))[0]
-    elif len(q_img.shape) == 4:
-        q_img = F.interpolate(q_img, size=(1024, 1024))[0]
-        cos_img = F.interpolate(cos_img, size=(1024, 1024))[0]
-        sin_img = F.interpolate(sin_img, size=(1024, 1024))[0]
-        width_img = F.interpolate(width_img, size=(1024, 1024))[0]
-
-    width_scale = 512
-    q_img = q_img.data.detach().cpu().numpy().squeeze()
-    ang_img = (torch.atan2(sin_img, cos_img) / 2.0).data.detach().cpu().numpy().squeeze()
-    width_img = width_img.data.detach().cpu().numpy().squeeze() * width_scale
-    
-    q_img = gaussian(q_img, 2.0, preserve_range=True)
-    ang_img = gaussian(ang_img, 2.0, preserve_range=True)
-    width_img = gaussian(width_img, 1.0, preserve_range=True)
-
-    return q_img, ang_img, width_img
-
-# ... (cal_grasp_ious 保持不变) ...
-def cal_grasp_ious(test_dataset, model, args):
-    test_loader = torch.utils.data.DataLoader(test_dataset, 1, pin_memory=False, 
-                                               num_workers=4, shuffle=True)
-    ld = len(test_loader)
-    results = {"correct": 0, "failed": 0, 
-               "g_loss":0, 
-               "g_losses":{
-                "p_loss": 0, "cos_loss": 0, "sin_loss": 0, "width_loss": 0,}}
-    
-    model.eval()
-    with torch.no_grad():
-        for idx, data in enumerate(test_loader):
-            prompts = None
-            if len(data) == 7:
-                images, masks, grasps, didx, rot, zoom_factor, prompts = data
-            else:
-                images, masks, grasps, didx, rot, zoom_factor = data
-
-            images = images.to(args.device)    
-            masks = masks.to(args.device)
-            grasps = [g.to(args.device) for g in grasps]
-            
-            targets = {}
-            targets["masks"] = masks
-            targets["grasps"] = grasps
-            
-            input_type = "default"
-            if prompts is not None:
-                targets["prompts"] = prompts
-                input_type = "text"
-                
-            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type=input_type)    
-            lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-
-            loss = lossd["g_loss"]
-            results['g_loss'] += loss.item() / ld
-            for ln, l in lossd['g_losses'].items():
-                if ln not in results['g_losses']:
-                    results['g_losses'][ln] = 0
-                results['g_losses'][ln] += l.item() / ld
-
-            q_out, ang_out, w_out = post_process_output(lossd['pred']['pos'], lossd['pred']['cos'],
-                                                        lossd['pred']['sin'], lossd['pred']['width'])
-
-            success = calculate_iou_match(q_out, ang_out, 
-                                          test_dataset.get_gtbb(didx.item(), rot.item(), zoom_factor.item()), 
-                                          no_grasps=1, 
-                                          grasp_width=w_out)
-            if success:
-                results["correct"] += 1
-            else:
-                results["failed"] += 1
-            
-            success_rate = 100 * results["correct"] / (results["correct"] + results["failed"])
-    return results["g_loss"], success_rate
-
-def setup_model(model_type, sam_encoder_type, prompt_mode):
-    if model_type == "bs_grasp_sam":
-        model = PlanarGraspSAM(sam_encoder_type=sam_encoder_type, num_layers=0)
-    else:
-        raise("please input correct model type")
-    return model
-
-def main(args):
-    is_save = args.save
-    
-    if is_save:
-        if args.seen:
-            args.exp_name = "seen" + "_" + args.sam_encoder_type + "_" + args.prompt
-        else:
-            args.exp_name = "total" + "_" + args.sam_encoder_type + "_" + args.prompt
-
-        exp_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
-        save_path = os.path.join(args.save_dir, args.exp_name, args.dataset_name, '{}'.format(exp_time))
-        
-        if not os.path.exists(save_path):
-            os.makedirs(save_path, exist_ok=True)
-
-        f = open(os.path.join(save_path, "info.txt"), 'w')
-        f.write(str(args))
-        f.close()
-        
-    args.device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
-        
-    if args.dataset_name == "grasp_anything_plus":
-
-        train_dataset = GraspAnythingPlusPlusDataset(root=args.root, include_mask=True, include_prompt=True,
-            random_rotate=False, random_zoom=False, seen=args.seen, train=True)
-        test_dataset = GraspAnythingPlusPlusDataset(root=args.root, include_mask=True, include_prompt=True,
-            random_rotate=False, random_zoom=False, seen=args.seen, train=False)
-    
-        
-        
-    print("train_dataset size : {}".format(train_dataset.__len__()))
-    print("test_dataset size : {}".format(test_dataset.__len__()))
-
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, pin_memory=False, num_workers=4, shuffle=True)
-    
-    model = setup_model(model_type="bs_grasp_sam", sam_encoder_type=args.sam_encoder_type, prompt_mode=args.prompt)
-
-    if args.resume_ckp:
-        state_dict = torch.load(args.resume_ckp, map_location='cpu')
-        # 加载时必须 strict=False，因为保存的模型里缺少了 clip 权重
-        model.load_state_dict(state_dict['model'], strict=False)
-
-    model.to(args.device)
-    model.train()
-
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 20, 1e-7)
-    
-    start_epoch = 0
-    if args.resume_ckp:
-        start_epoch = state_dict['epoch']
-        optimizer.load_state_dict(state_dict['optimizer'])
-        scheduler.load_state_dict(state_dict['scheduler'])
-
-    print("-"*80)
-
-    best_success_rate = 0.0
-
-    for epoch in range(start_epoch, args.epochs):
-        t_progress = TrainProgress(train_loader, epoch)
-        
-        for i, data in enumerate(train_loader):
-            prompts = None
-            if len(data) == 7:
-                images, masks, grasps, idx, rot, zoom_factor, prompts = data
-            else:
-                images, masks, grasps, idx, rot, zoom_factor = data
-        
-            images = images.to(args.device)
-            masks = masks.to(args.device)
-            grasps = [g.to(args.device) for g in grasps]
-
-            targets = {}
-            targets["masks"] = masks
-            targets["grasps"] = grasps
-            if prompts is not None:
-                targets["prompts"] = prompts
-            
-            optimizer.zero_grad()
-            
-            if prompts is not None:
-                grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type="text")
-            else:
-                grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type="default")
-
-            lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-            loss = lossd["loss"]
-            loss.backward()
-
-            optimizer.step()
-            
-            t_progress.progress_update(lossd, args.batch_size)
-            if i % args.print_freq == 0:
-                t_progress.progress.display(i)
-
-        scheduler.step()
-        print("-"*80)
-
-        if args.validate and epoch >= args.save_start_epoch:
-            g_loss, success_rate = cal_grasp_ious(test_dataset, model, args)
-            print("epoch : {} / g_loss : {:.4f} / success_rate : {:.4f}".format(epoch, g_loss, success_rate))
-
-            if args.save: 
-                if success_rate > best_success_rate or epoch == 0 or (epoch % 10) == 0:
-                    best_success_rate = success_rate
-                    # [修改] 使用 get_clean_state_dict 过滤掉 clip 权重
-                    save_dict = {
-                        "epoch" : epoch,
-                        "model" : get_clean_state_dict(model),
-                        "optimizer" : optimizer.state_dict(),
-                        "scheduler" : scheduler.state_dict(),
-                    }
-                    
-                    torch.save(save_dict, os.path.join(save_path, "epoch_%02d_sr_%0.2f.pth" % (epoch, success_rate)))
-                    print("save best model in {}".format(save_path))
-        elif epoch >= args.save_start_epoch:
-            if args.save:
-                # [修改] 使用 get_clean_state_dict 过滤掉 clip 权重
-                save_dict = {
-                        "epoch" : epoch,
-                        "model" : get_clean_state_dict(model),
-                        "optimizer" : optimizer.state_dict(),
-                        "scheduler" : scheduler.state_dict(),
-                    }
-                
-                torch.save(save_dict, os.path.join(save_path, "epoch{}.pth".format(str(epoch))))
-                print("save model in {}".format(save_path))
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sam-encoder-type", type=str, default="eff_vit_t_w_ad")
-    parser.add_argument("--gpu-num", type=int, default=2, help="gpu id number")
-    parser.add_argument("--dataset-name", type=str, default="jacquard", help="dataset name")
-    parser.add_argument("--root", type=str, help="dataset root")
-    parser.add_argument("--seen", action='store_true')
-    parser.add_argument("--prompt", type=str, default='default')
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--print-freq", type=int, default=100)
-    parser.add_argument("--save", action='store_true')
-    parser.add_argument("--save-dir", type=str, default="final_result")
-    parser.add_argument("--resume-ckp", type=str, default=None)
-    parser.add_argument("--validate", action='store_true')
-    parser.add_argument("--split", default=0.9, type=float)
-    parser.add_argument("--save-start-epoch", type=int, default=0, help="start saving best model after this epoch")
-    args = parser.parse_args()
-
-    main(args)
-```
-
-## 5.planar_grasp_sam_language_part.py(手动新增)
-
 ```
 import os
 import sys
 import random
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import clip # 需要 pip install git+https://github.com/openai/CLIP.git
+import clip
 
 from typing import Dict, List, Tuple
-from model.utils import LayerNorm2d, MLP, masks_sample_points, masks_to_boxes, masks_noise, dice_loss
-from model.build_grasp_sam import build_grasp_sam
 
-# ==============================================================================
-# 1. 辅助模块 (保留必要的 Decoder 和 Header 结构)
-# ==============================================================================
+from model.utils import LayerNorm2d, MLP, masks_sample_points, masks_to_boxes, masks_noise, dice_loss
+
+
+from model.build_grasp_sam import build_grasp_sam
 
 class SamEncoder(nn.Module):
     def __init__(self, image_encoder, prompt_encoder, sam_encoder_type):
         super(SamEncoder, self).__init__()
+        
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
         self.sam_encoder_type = sam_encoder_type
 
     def forward(self, batched_input):
+        
         input_images = torch.stack([x["image"] for x in batched_input], dim=0)
         image_embeddings, interm_embeddings = self.image_encoder(input_images)
         
         batched_output = []
-        for curr_embedding in image_embeddings:
-            # 对于纯文本任务，这里不需要处理 point_coords，
-            # sparse_embeddings 将由外部 CLIP 生成后传入
+        for image_record, curr_embedding in zip(batched_input, image_embeddings):
+            
+            # === 修改开始：检查 point_coords 是否存在 ===
+            sparse_embeddings = None
+            dense_embeddings = None
+
+            if "point_coords" in image_record:
+                if "eff" in self.sam_encoder_type:
+                    sparse_embeddings = self.prompt_encoder(
+                        coords=image_record["point_coords"],
+                        labels=image_record["point_labels"]
+                    )
+                else:
+                    points = (image_record["point_coords"], image_record["point_labels"])
+                    sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                        points=points,
+                        boxes=image_record.get("boxes", None),
+                        masks=image_record.get("mask_inputs", None),
+                    )
+            # === 修改结束 ===
+            
+            # 如果是 text 模式，sparse_embeddings 为 None，
+            # 后续在 PlanarGraspSAM.total_forward 中会使用 CLIP 特征进行填充。
+
             batched_output.append(
                 {
                     "encoder_embedding": curr_embedding.unsqueeze(0),
-                    "image_pe": self.prompt_encoder.get_dense_pe(),
-                    "sparse_embeddings": None, # 占位
-                    "dense_embeddings": None,
+                    "image_pe": self.prompt_encoder.get_dense_pe(), # 必须保留位置编码
+                    "sparse_embeddings": sparse_embeddings,
+                    "dense_embeddings": dense_embeddings,
                 }
             )
+
         return batched_output, interm_embeddings
 
 class ConvGraspHeader(nn.Module):
     def __init__(self, num_layers=3):
         super(ConvGraspHeader, self).__init__()
+
         self.layer = []
         for i in range(0, num_layers):
             self.layer.append(nn.Sequential(nn.Conv2d(4, 4, kernel_size=1),
-                              nn.BatchNorm2d(4), nn.ReLU()))
+                              nn.BatchNorm2d(4),
+                              nn.ReLU()))
         self.early_conv = nn.Sequential(*self.layer)
+
         self.point_predictor = nn.Conv2d(1, 1, kernel_size=1, bias=False)
         self.width_predictor = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+        
         self.cos_predictor   = nn.Conv2d(1, 1, kernel_size=1, bias=False)
         self.sin_predictor   = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+        
+        self.fusion          = nn.Conv2d(2, 1, kernel_size=1, bias=False)
+        
         
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None: nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+                
 
-    def forward(self, x):       
-        if len (self.layer) > 0: x = self.early_conv(x)
+    def forward(self, x):       # x: [1, 4, 256, 256]
+        
+        if len (self.layer) > 0:
+            x = self.early_conv(x)
+        # pos_out   = F.sigmoid(self.point_predictor(x[:,0]))
+        # width_out = F.sigmoid(self.width_predictor(x[:,1]))
         pos_out   = F.relu(self.point_predictor(x[:,0]))
         width_out = F.relu(self.width_predictor(x[:,1]))
+    
         cos_out   = self.cos_predictor(x[:,2])
         sin_out   = self.sin_predictor(x[:,3])
+
         return pos_out, cos_out, sin_out, width_out 
 
 class SamDecoder(nn.Module):
     def __init__(self, mask_decoder, sam_encoder_type, grasp_header_type, num_layers):
         super(SamDecoder, self).__init__()
+
         self.mask_decoder = mask_decoder
         self.sam_encoder_type = sam_encoder_type
         
@@ -4514,25 +4168,41 @@ class SamDecoder(nn.Module):
         self.mask_tokens = self.mask_decoder.mask_tokens
         self.num_mask_tokens = self.mask_decoder.num_mask_tokens
         
+        
         if "eff" in sam_encoder_type:
             self.iou_prediction_head = self.mask_decoder.iou_prediction_head
+            
+            
             def output_upscaling(upscaled_embedding):
                 for upscaling_layer in self.mask_decoder.final_output_upscaling_layers:
                     upscaled_embedding = upscaling_layer(upscaled_embedding)
                 return upscaled_embedding
+
             self.output_upscaling = output_upscaling
+              
+            
             self.output_hypernetworks_mlps = self.mask_decoder.output_hypernetworks_mlps
+            
         else:
             self.iou_prediction_head = self.mask_decoder.iou_prediction_head
             self.output_upscaling = self.mask_decoder.output_upscaling
             self.output_hypernetworks_mlps = self.mask_decoder.output_hypernetworks_mlps
         
-        transformer_dim=256
-        vit_dim_dict = {"vit_t":160, "vit_t_w_ad":160, "eff_vit_t":192, "eff_vit_s":384, "eff_vit_t_w_ad":192, "eff_vit_s_w_ad":384}
-        vit_dim = vit_dim_dict.get(sam_encoder_type, 192) # Default fallback
         
+        self.grasp_header_type = grasp_header_type
+        
+        self.num_grasp_queries = 4 
+        transformer_dim=256
+        
+        vit_dim_dict = {"vit_b":768,"vit_l":1024,"vit_h":1280,"vit_t":160, "vit_t_w_ad":160,
+                        "eff_vit_t":192, "eff_vit_s":384, "eff_vit_t_w_ad":192, "eff_vit_s_w_ad":384}
+        
+        vit_dim = vit_dim_dict[sam_encoder_type]
+        
+                
         self.hf_token = nn.Embedding(1, transformer_dim)
         self.hf_mlp = MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
+
         
         self.num_grasp_tokens = 4
         self.grasp_token = nn.Embedding(self.num_grasp_tokens, transformer_dim)
@@ -4543,56 +4213,92 @@ class SamDecoder(nn.Module):
         self.num_hq_tokens = self.num_mask_tokens + 1
         self.num_total_tokens = self.num_hq_tokens + self.num_grasp_tokens
 
-        mid_compress_dim = transformer_dim//2 if 'vit_t' in sam_encoder_type else transformer_dim
-        out_compress_dim = transformer_dim//8
+
+        
+        if 'vit_t' in sam_encoder_type:
+            mid_compress_dim = transformer_dim//2
+            out_compress_dim = transformer_dim//8
+        
+        else:
+            mid_compress_dim = transformer_dim
+            out_compress_dim = transformer_dim//8
+        
         
         self.compress_vit_feat = nn.Sequential(
                                 nn.ConvTranspose2d(vit_dim, mid_compress_dim, kernel_size=2, stride=2),
-                                LayerNorm2d(mid_compress_dim), nn.GELU(), 
+                                LayerNorm2d(mid_compress_dim),
+                                nn.GELU(), 
                                 nn.ConvTranspose2d(mid_compress_dim, out_compress_dim, kernel_size=2, stride=2))
         
         self.compress_vit_feat_g = nn.Sequential(
                                 nn.ConvTranspose2d(vit_dim, mid_compress_dim, kernel_size=2, stride=2),
-                                LayerNorm2d(mid_compress_dim), nn.GELU(), 
+                                LayerNorm2d(mid_compress_dim),
+                                nn.GELU(), 
                                 nn.ConvTranspose2d(mid_compress_dim, out_compress_dim, kernel_size=2, stride=2))
+        
+        
         
         self.embedding_encoder_mask = nn.Sequential(
                                 nn.ConvTranspose2d(transformer_dim, transformer_dim//4, kernel_size=2, stride=2),
-                                LayerNorm2d(transformer_dim//4), nn.GELU(),
+                                LayerNorm2d(transformer_dim//4),
+                                nn.GELU(),
                                 nn.ConvTranspose2d(transformer_dim//4, transformer_dim//8, kernel_size=2, stride=2))
+
 
         self.embedding_maskfeature = nn.Sequential(
                                 nn.Conv2d(transformer_dim//8, transformer_dim // 4, 3, 1, 1), 
-                                LayerNorm2d(transformer_dim // 4), nn.GELU(),
+                                LayerNorm2d(transformer_dim // 4),
+                                nn.GELU(),
                                 nn.Conv2d(transformer_dim//4, transformer_dim//8, 3, 1, 1))
 
+        
         self.embedding_encoder_grasp = nn.Sequential(
                                 nn.ConvTranspose2d(transformer_dim, transformer_dim//4, kernel_size=2, stride=2),
-                                LayerNorm2d(transformer_dim // 4), nn.GELU(),
+                                LayerNorm2d(transformer_dim // 4),
+                                nn.GELU(),
                                 nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2))
+        
 
         self.embedding_graspfeature = nn.Sequential(
                                 nn.Conv2d(transformer_dim//8, transformer_dim//4, 3, 1, 1), 
-                                LayerNorm2d(transformer_dim//4), nn.GELU(),
+                                LayerNorm2d(transformer_dim//4),
+                                nn.GELU(),
                                 nn.Conv2d(transformer_dim//4, transformer_dim//8, 3, 1, 1))
+
+        
+        
         
         self.grasp_header = ConvGraspHeader(num_layers=num_layers)
         
-    def predict_grasps(self, image_embeddings, image_pe, sparse_prompt_embeddings, dense_prompt_embeddings, hq_feature, grasp_feature):
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight, self.hf_token.weight, self.grasp_token.weight], dim=0)
-        output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
+    def predict_grasps(
+        self,
+        image_embeddings,
+        image_pe,
+        sparse_prompt_embeddings,
+        dense_prompt_embeddings,
+        hq_feature,
+        grasp_feature
+    ):
 
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)
-        if "eff" not in self.sam_encoder_type and dense_prompt_embeddings is not None:
-             src = src + dense_prompt_embeddings
+        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight, self.hf_token.weight, self.grasp_token.weight], dim=0) #[7, 256]
+        output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)                                       #[1, 7, 256]
+        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)                                                              #[1, 11, 256]
+
+    
+        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)                                                          #[1, 256, 64, 64]
+        
+        if "eff" in self.sam_encoder_type:
+            pass
+        else:
+            src = src + dense_prompt_embeddings
         
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
-        hs, src = self.transformer(src, pos_src, tokens)
-        iou_token_out = hs[:, 0, :]
+        hs, src = self.transformer(src, pos_src, tokens)            # [B, 21, 256] /[1, 4096, 256]
+        iou_token_out = hs[:, 0, :]                                 # [1, 256]
         mask_tokens_out = hs[:, 1 : (1 + self.num_total_tokens), :]
+
         
         src = src.transpose(1, 2).view(b, c, h, w)   
         upscaled_embedding_sam = self.output_upscaling(src)
@@ -4601,38 +4307,75 @@ class SamDecoder(nn.Module):
          
         hyper_in_list = []
         for i in range(self.num_total_tokens):
-            if i < 4: hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
-            elif i == 4: hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
-            elif i > 4: hyper_in_list.append(self.grasp_mlp[i-5](mask_tokens_out[:, i, :]))
+            if i < 4:
+                hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
+            elif i == 4:
+                hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
+            elif i > 4:
+                hyper_in_list.append(self.grasp_mlp[i-5](mask_tokens_out[:, i, :]))
         
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding_sam.shape
+        
         
         masks_sam = (hyper_in[:,:4] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
         masks_ours = (hyper_in[:,4] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
         masks = torch.cat([masks_sam,masks_ours],dim=1)
         
         iou_pred = self.iou_prediction_head(iou_token_out)
+
+        # grasp = (hyper_in[:, -1] @ upscaled_embedding_grasp.view(b, c, h * w)).view(b, -1, h, w)           #[1, 1, 256, 256]
         grasp_maps = (hyper_in[:,5:] @ upscaled_embedding_grasp.view(b, c, h * w)).view(b, -1, h, w)
+   
         grasp = self.grasp_header(grasp_maps)
 
         return masks, iou_pred, grasp
     
 
-    def forward(self, image_embeddings, image_pe, sparse_prompt_embeddings, dense_prompt_embeddings, multimask_output, interm_embeddings):
-        vit_features = interm_embeddings[0].permute(0, 3, 1, 2)
+    def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        image_pe: torch.Tensor,
+        sparse_prompt_embeddings: torch.Tensor,
+        dense_prompt_embeddings: torch.Tensor,
+        multimask_output: bool,
+        interm_embeddings: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict masks given image and prompt embeddings.
+
+        Arguments:
+          image_embeddings (torch.Tensor): the embeddings from the ViT image encoder
+          image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
+          sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
+          dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
+          multimask_output (bool): Whether to return multiple masks or a single
+            mask.
+
+        Returns:
+          torch.Tensor: batched predicted hq masks
+        """
+        # print(len(interm_embeddings))
+        # print(interm_embeddings[0].shape)
+        # exit()
+        vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
         hq_features = self.embedding_encoder_mask(image_embeddings) + self.compress_vit_feat(vit_features)
         grasp_features= self.embedding_encoder_grasp(image_embeddings) + self.compress_vit_feat_g(vit_features) 
 
         batch_len = len(image_embeddings)
-        masks, iou_preds, grasps_pos, grasps_cos, grasps_sin, grasps_width = [], [], [], [], [], []
+        masks = []
+        iou_preds = []
+        grasps_pos = []
+        grasps_cos = []
+        grasps_sin = []
+        grasps_width = []
         
         for i_batch in range(batch_len):
             mask, iou_pred, grasp_pred = self.predict_grasps(
                 image_embeddings=image_embeddings[i_batch].unsqueeze(0),
                 image_pe=image_pe[i_batch],
                 sparse_prompt_embeddings=sparse_prompt_embeddings[i_batch],
-                dense_prompt_embeddings=dense_prompt_embeddings[i_batch] if dense_prompt_embeddings is not None else None,
+                dense_prompt_embeddings=dense_prompt_embeddings[i_batch],
                 hq_feature = hq_features[i_batch].unsqueeze(0),
                 grasp_feature = grasp_features[i_batch].unsqueeze(0)
             )
@@ -4643,22 +4386,38 @@ class SamDecoder(nn.Module):
             grasps_sin.append(grasp_pred[2])
             grasps_width.append(grasp_pred[3])
             
-        grasps = [torch.cat(grasps_pos,0), torch.cat(grasps_cos,0), torch.cat(grasps_sin,0), torch.cat(grasps_width,0)]
+            
+        grasps_poses = torch.cat(grasps_pos,0)
+        grasps_coses = torch.cat(grasps_cos,0)
+        grasps_sines = torch.cat(grasps_sin,0)
+        grasps_widthes = torch.cat(grasps_width,0)
+        
+        grasps = [grasps_poses, grasps_coses, grasps_sines, grasps_widthes]
+    
         masks = torch.cat(masks,0)
         iou_preds = torch.cat(iou_preds,0)
 
-        # 默认使用 hq mask
+        if multimask_output:
+            mask_slice = slice(1,self.num_hq_tokens-1)
+            iou_preds = iou_preds[:, mask_slice]
+            iou_preds, max_iou_idx = torch.max(iou_preds,dim=1)
+            iou_preds = iou_preds.unsqueeze(1)
+            masks_multi = masks[:, mask_slice, :, :]
+            masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)       
+                 
+        else:
+            mask_slice = slice(0, 1)
+            masks_sam = masks[:,mask_slice]            
+
+        
         masks_hq = masks[:,slice(self.num_hq_tokens-1, self.num_hq_tokens), :, :]
+        
+ 
         return grasps, masks_hq
 
-
-# ==============================================================================
-# 2. 核心类：PlanarGraspSAMPart
-# ==============================================================================
-
-class PlanarGraspSAMPart(nn.Module):
+class PlanarGraspSAM(nn.Module):
     def __init__(self, sam_encoder_type, vis=False, num_layers=0):
-        super(PlanarGraspSAMPart, self).__init__()
+        super(PlanarGraspSAM, self).__init__()
         
         # 1. 构建基础 SAM 模型
         self.image_encoder, self.prompt_encoder, self.mask_decoder = build_grasp_sam(sam_encoder_type, adapter=False)
@@ -4668,159 +4427,434 @@ class PlanarGraspSAMPart(nn.Module):
         self.sam_encoder_type = sam_encoder_type
         self.vis = vis
         
-        # 2. 初始化 CLIP 文本编码器
-        print("Loading CLIP model (ViT-B/32)...")
-        # 注意：这里默认加载到 CPU，后续 forward 时数据在哪个 device，CLIP 需要手动 to(device)
-        self.clip_model, _ = clip.load("ViT-B/32", device="cpu") 
+        # ================= 新增：CLIP Text Encoder =================
+        print("Loading CLIP model...")
+        # 加载 CLIP 模型 (ViT-B/32 是常用的轻量版本)
+        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cpu") # 先加载到 CPU，后续转到 device
         
-        # 冻结 CLIP 参数
+        # 冻结 CLIP 参数 (通常不需要微调 CLIP)
         for param in self.clip_model.parameters():
             param.requires_grad = False
             
-        # 3. 文本投影层 (CLIP 512 -> SAM 256)
-        self.prompt_dim = 256
-        self.clip_dim = 512
+        # 文本投影层：将 CLIP 的 512 维特征投影到 SAM 的 256 维特征
+        self.prompt_dim = 256  # SAM 默认维度
+        self.clip_dim = 512    # ViT-B/32 输出维度
         self.text_projector = nn.Linear(self.clip_dim, self.prompt_dim)
         
         # 初始化投影层
         nn.init.kaiming_normal_(self.text_projector.weight, mode='fan_in', nonlinearity='relu')
         nn.init.constant_(self.text_projector.bias, 0)
+        # ==========================================================
 
-    def total_forward(self, imgs, targets):
-        """
-        专门处理 Part-Level Language Grasping。
-        imgs: List[Tensor] (B, 3, H, W)
-        targets: Dict, 必须包含 'prompts'
-        """
-        device = imgs[0].device
+    def total_forward(self, imgs, targets, input_type="text"): # 默认改为 text 或在训练时指定
         
-        # 1. 准备 Image Input
+        # 1. 准备输入 Image Batch
         batched_input = []
-        for img in imgs:
-            batched_input.append({'image': img, 'original_size': img.shape[:2]})
-        
-        # 2. 图像编码 (ViT)
+        for b_i in range(len(imgs)):
+            dict_input = dict()
+            dict_input['image'] = imgs[b_i]
+            dict_input['original_size'] = imgs[b_i].shape[:2]
+            
+            # 如果是点或框模式，保留原有逻辑
+            if input_type in ['box', 'point', 'default', '1point', '3point', '5point', '10point']:
+                # ... (保留您原有的点/框采样代码) ...
+                # 这里为了简洁省略，请保留您原文件中的点/框处理逻辑
+                pass
+            
+            batched_input.append(dict_input)
+     
+        # 2. 图像编码 (Image Encoding)
+        # batched_output 包含 image_embedding 和 (如果是点框模式的) sparse_embeddings
         batched_output, interm_embeddings = self.encoder(batched_input)
         
-        # 收集 batch 维度的特征
         batch_len = len(batched_output)
-        encoder_embedding = torch.cat([x['encoder_embedding'] for x in batched_output], dim=0)
-        image_pe = [x['image_pe'] for x in batched_output]
-        
-        # 3. 文本编码 (CLIP)
+        encoder_embedding = torch.cat([batched_output[i_l]['encoder_embedding'] for i_l in range(batch_len)], dim=0)
+        image_pe = [batched_output[i_l]['image_pe'] for i_l in range(batch_len)]
+        dense_embeddings = [batched_output[i_l]['dense_embeddings'] for i_l in range(batch_len)] # 通常为 None 或全零
+
+        # ================= 修改：处理 Prompt Embeddings =================
         sparse_embeddings = []
         
-        if "prompts" not in targets:
-            raise ValueError("Target dict must contain 'prompts' for language grasping.")
-            
-        text_inputs = targets['prompts'] 
-        # GraspAnythingPartDataset 返回的是 ('instr1', 'instr2', ...) 这种元组/列表
-        # 确保转为 list
-        if isinstance(text_inputs, tuple):
-            text_inputs = list(text_inputs)
-            
-        # CLIP Tokenize
-        text_tokens = clip.tokenize(text_inputs).to(device)
-        
-        # CLIP Encode (Freeze)
-        # 确保 CLIP 模型在正确的设备上
-        self.clip_model = self.clip_model.to(device)
-        with torch.no_grad():
-            text_features = self.clip_model.encode_text(text_tokens) # (B, 512)
-            text_features = text_features.float()
-            
-        # Project -> SAM Space
-        sam_text_features = self.text_projector(text_features) # (B, 256)
-        
-        # Reshape to (B, 1, 256) as sparse embedding (1 point/token equivalent)
-        sparse_embeddings_tensor = sam_text_features.unsqueeze(1)
-        
-        for i in range(batch_len):
-            sparse_embeddings.append(sparse_embeddings_tensor[i:i+1])
+        if input_type == 'text':
+            # 获取文本提示
+            # targets['prompts'] 是一个 tuple (scene_descs, obj_queries)
+            # 我们只需要 obj_queries (例如 "spoon")
+            if "prompts" in targets:
+                # 假设 targets['prompts'] 是 ([desc1, ...], [query1, ...])
+                # 解包并在 batch 维度循环
+                _, obj_queries = targets['prompts'] 
+                
+                # 处理文本编码
+                text_tokens = clip.tokenize(obj_queries).to(imgs.device)
+                
+                with torch.no_grad():
+                    # CLIP 编码 -> (B, 512)
+                    text_features = self.clip_model.encode_text(text_tokens)
+                    text_features = text_features.float() # 半精度转单精度
+                
+                # 投影到 SAM 维度 -> (B, 256)
+                sam_text_features = self.text_projector(text_features)
+                
+                # 调整形状为 Sparse Embedding 格式: (B, 1, 256)
+                # 这里的 1 表示它被视为 1 个 prompt token
+                sparse_embeddings_tensor = sam_text_features.unsqueeze(1)
+                
+                # 分解回 list 以适配后续逻辑
+                for i in range(batch_len):
+                    sparse_embeddings.append(sparse_embeddings_tensor[i:i+1])
+                    
+            else:
+                raise ValueError("Input type is 'text' but no prompts found in targets.")
+                
+        else:
+            # 如果是 box/point 模式，直接使用 encoder 返回的 sparse_embeddings
+            sparse_embeddings = [batched_output[i_l]['sparse_embeddings'] for i_l in range(batch_len)]
+        # ==============================================================
 
-        # 4. 解码 (Decoder)
+        # 3. 解码 (Decoding)
         results = self.decoder(
-            image_embeddings = encoder_embedding,
-            image_pe = image_pe,
-            sparse_prompt_embeddings = sparse_embeddings,
-            dense_prompt_embeddings = None, # 文本任务无 Dense Prompt
-            multimask_output = False,
-            interm_embeddings = interm_embeddings
-        )
+                    image_embeddings  = encoder_embedding, 
+                    image_pe          = image_pe,
+                    sparse_prompt_embeddings = sparse_embeddings,
+                    dense_prompt_embeddings  = dense_embeddings,
+                    multimask_output=False,
+                    interm_embeddings = interm_embeddings,
+                    )
         
-        return results
+        if self.vis:
+            # 返回 prompt 以便可视化
+            if input_type == "text":
+                prompt_input = targets['prompts'][1] # 返回文本 query
+            elif input_type == "point":
+                prompt_input = batched_input[0]['point_coords']
+            elif input_type == "box":
+                prompt_input = batched_input[0]['boxes']
+            else:
+                prompt_input = None
+            return results, prompt_input
+            
+        else:
+            return results
+    
 
     def weighted_mse(self, preds, targets, masks, weight=0.01):
+        
         preds = preds.view(-1, 256**2)
         targets = targets.view(-1, 256**2)
         masks = masks.view(-1, 256**2)
         
         loss = 0
         for pd, gt, mk in zip(preds, targets, masks):
-            # 前景 Loss
-            fore_pred = pd[mk>0]
+            fore_pred = pd[mk>0].clone()
             fore_gt = gt[mk>0]
-            if fore_pred.numel() > 0:
-                fore = F.mse_loss(fore_pred, fore_gt)
-            else:
-                fore = 0.0
-            
-            # 背景 Loss
-            back_pred = pd[mk==0]
+            fore = F.mse_loss(fore_pred, fore_gt)
+        
+            back_pred = pd[mk==0].clone() 
             back_gt = gt[mk==0]
-            back = F.mse_loss(back_pred, back_gt)
+            back =  F.mse_loss(back_pred, back_gt)
             
             batch_loss = fore + (back * weight)
             loss += batch_loss
         
-        return loss / masks.shape[0]
-
-    def compute_loss(self, grasp_pred, mask_pred, target, g_s=1.0, m_s=1.0, p=2.0, c=1.0, s=1.0, w=1.0):
+        mean_loss = loss / masks.shape[0]
+            
+        return mean_loss
+        
+        
+    def compute_loss(self, grasp_pred, mask_pred, target, g_s, m_s, p, c, s, w):
+        g_s = g_s
+        m_s = m_s
+    
         grasps_gt = target["grasps"]
         masks_gt = target["masks"]
-        
-        # 下采样 GT Mask 到 256x256 以匹配输出
         masks_gt = F.interpolate(masks_gt, size=(256, 256))
-        
+ 
         pos_pred, cos_pred, sin_pred, width_pred = grasp_pred
-        pos_gt, cos_gt, sin_gt, width_gt = grasps_gt
         
-        # 下采样 GT Grasp Maps
-        pos_gt   = F.interpolate(pos_gt, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        cos_gt   = F.interpolate(cos_gt, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        sin_gt   = F.interpolate(sin_gt, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        width_gt = F.interpolate(width_gt, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
+        pos, cos, sin, width = grasps_gt
         
-        # 计算 Grasp Loss
-        p_loss = self.weighted_mse(pos_pred, pos_gt, masks_gt)
-        cos_loss = self.weighted_mse(cos_pred, cos_gt, masks_gt)
-        sin_loss = self.weighted_mse(sin_pred, sin_gt, masks_gt)
-        width_loss = self.weighted_mse(width_pred, width_gt, masks_gt)
-        
+        pos   = F.interpolate(pos, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
+        cos   = F.interpolate(cos, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
+        sin   = F.interpolate(sin, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
+        width = F.interpolate(width, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)    
+    
+        p_loss = self.weighted_mse(pos_pred, pos, masks_gt)
+        cos_loss = self.weighted_mse(cos_pred, cos, masks_gt)
+        sin_loss = self.weighted_mse(sin_pred, sin, masks_gt)
+        width_loss = self.weighted_mse(width_pred, width, masks_gt)
+    
         grasp_loss = p*p_loss + c*cos_loss + s*sin_loss + w*width_loss
-        
-        # 计算 Mask Loss
+    
         d_loss = dice_loss(mask_pred, masks_gt)
         bce_loss = F.binary_cross_entropy_with_logits(mask_pred, masks_gt)
         mask_loss = d_loss + bce_loss
-        
+
         total_loss = g_s*grasp_loss + m_s*mask_loss
-        
+
+
         return {
             "loss": total_loss,
-            "mask_loss": mask_loss,
-            "g_loss": grasp_loss,
-            "g_losses": {
+            "mask_loss" : mask_loss,
+            "g_loss" : grasp_loss,
+            "g_losses":{
                 "p_loss": p_loss,
                 "cos_loss": cos_loss,
                 "sin_loss": sin_loss,
                 "width_loss": width_loss,
-            },
-            "pred": {
-                "pos": pos_pred, "cos": cos_pred, "sin": sin_pred, "width": width_pred
+                },
+            "pred":{
+                "pos" : pos_pred,
+                "cos" : cos_pred,
+                "sin" : sin_pred,
+                "width" : width_pred
+
             }
         }
+    
+
 ```
+
+## 5.planar_grasp_sam_language_part.py(手动新增)
+
+```
+
+```
+
+## 6.grasp_model.py（手动新增）
+
+```
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GraspModel(nn.Module):
+    """
+    An abstract model for grasp network in a common format.
+    """
+
+    def __init__(self):
+        super(GraspModel, self).__init__()
+
+    def forward(self, x_in):
+        raise NotImplementedError()
+
+    def compute_loss(self, xc, yc):
+        y_pos, y_cos, y_sin, y_width = yc
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+
+        p_loss = F.smooth_l1_loss(pos_pred, y_pos)
+        cos_loss = F.smooth_l1_loss(cos_pred, y_cos)
+        sin_loss = F.smooth_l1_loss(sin_pred, y_sin)
+        width_loss = F.smooth_l1_loss(width_pred, y_width)
+
+        return {
+            'loss': p_loss + cos_loss + sin_loss + width_loss,
+            'losses': {
+                'p_loss': p_loss,
+                'cos_loss': cos_loss,
+                'sin_loss': sin_loss,
+                'width_loss': width_loss
+            },
+            'pred': {
+                'pos': pos_pred,
+                'cos': cos_pred,
+                'sin': sin_pred,
+                'width': width_pred
+            }
+        }
+
+    def predict(self, xc):
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+        return {
+            'pos': pos_pred,
+            'cos': cos_pred,
+            'sin': sin_pred,
+            'width': width_pred
+        }
+
+class LanguageGraspModel(nn.Module):
+    """
+    An abstract model for grasp network in a common format.
+    """
+
+    def __init__(self):
+        super(LanguageGraspModel, self).__init__()
+
+    def forward(self, x_in):
+        raise NotImplementedError()
+
+    def compute_loss(self, xc, yc, prompt, query):
+        y_pos, y_cos, y_sin, y_width = yc
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc, prompt, query)
+
+        p_loss = F.smooth_l1_loss(pos_pred, y_pos)
+        cos_loss = F.smooth_l1_loss(cos_pred, y_cos)
+        sin_loss = F.smooth_l1_loss(sin_pred, y_sin)
+        width_loss = F.smooth_l1_loss(width_pred, y_width)
+
+        return {
+            'loss': p_loss + cos_loss + sin_loss + width_loss,
+            'losses': {
+                'p_loss': p_loss,
+                'cos_loss': cos_loss,
+                'sin_loss': sin_loss,
+                'width_loss': width_loss
+            },
+            'pred': {
+                'pos': pos_pred,
+                'cos': cos_pred,
+                'sin': sin_pred,
+                'width': width_pred
+            }
+        }
+
+    def predict(self, xc):
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+        return {
+            'pos': pos_pred,
+            'cos': cos_pred,
+            'sin': sin_pred,
+            'width': width_pred
+        }
+
+class ResidualBlock(nn.Module):
+    """
+    A residual block with dropout option
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x_in):
+        x = self.bn1(self.conv1(x_in))
+        x = F.relu(x)
+        x = self.bn2(self.conv2(x))
+        return x + x_in
+
+```
+
+## 7.lggcnn.py（手动新增）
+
+```
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GraspModel(nn.Module):
+    """
+    An abstract model for grasp network in a common format.
+    """
+
+    def __init__(self):
+        super(GraspModel, self).__init__()
+
+    def forward(self, x_in):
+        raise NotImplementedError()
+
+    def compute_loss(self, xc, yc):
+        y_pos, y_cos, y_sin, y_width = yc
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+
+        p_loss = F.smooth_l1_loss(pos_pred, y_pos)
+        cos_loss = F.smooth_l1_loss(cos_pred, y_cos)
+        sin_loss = F.smooth_l1_loss(sin_pred, y_sin)
+        width_loss = F.smooth_l1_loss(width_pred, y_width)
+
+        return {
+            'loss': p_loss + cos_loss + sin_loss + width_loss,
+            'losses': {
+                'p_loss': p_loss,
+                'cos_loss': cos_loss,
+                'sin_loss': sin_loss,
+                'width_loss': width_loss
+            },
+            'pred': {
+                'pos': pos_pred,
+                'cos': cos_pred,
+                'sin': sin_pred,
+                'width': width_pred
+            }
+        }
+
+    def predict(self, xc):
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+        return {
+            'pos': pos_pred,
+            'cos': cos_pred,
+            'sin': sin_pred,
+            'width': width_pred
+        }
+
+class LanguageGraspModel(nn.Module):
+    """
+    An abstract model for grasp network in a common format.
+    """
+
+    def __init__(self):
+        super(LanguageGraspModel, self).__init__()
+
+    def forward(self, x_in):
+        raise NotImplementedError()
+
+    def compute_loss(self, xc, yc, prompt, query):
+        y_pos, y_cos, y_sin, y_width = yc
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc, prompt, query)
+
+        p_loss = F.smooth_l1_loss(pos_pred, y_pos)
+        cos_loss = F.smooth_l1_loss(cos_pred, y_cos)
+        sin_loss = F.smooth_l1_loss(sin_pred, y_sin)
+        width_loss = F.smooth_l1_loss(width_pred, y_width)
+
+        return {
+            'loss': p_loss + cos_loss + sin_loss + width_loss,
+            'losses': {
+                'p_loss': p_loss,
+                'cos_loss': cos_loss,
+                'sin_loss': sin_loss,
+                'width_loss': width_loss
+            },
+            'pred': {
+                'pos': pos_pred,
+                'cos': cos_pred,
+                'sin': sin_pred,
+                'width': width_pred
+            }
+        }
+
+    def predict(self, xc):
+        pos_pred, cos_pred, sin_pred, width_pred = self(xc)
+        return {
+            'pos': pos_pred,
+            'cos': cos_pred,
+            'sin': sin_pred,
+            'width': width_pred
+        }
+
+class ResidualBlock(nn.Module):
+    """
+    A residual block with dropout option
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=1)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x_in):
+        x = self.bn1(self.conv1(x_in))
+        x = F.relu(x)
+        x = self.bn2(self.conv2(x))
+        return x + x_in
+
+```
+
+
 
 # 3.utils
 
@@ -5474,11 +5508,435 @@ unseen.onj
 
 # train.py
 
+```py
+import os
+import time
+import argparse
+import warnings
+import random
+import numpy as np
+
+warnings.filterwarnings(action='ignore')# 防止非致命警告刷屏
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"# 确保Python 程序看到的 GPU 编号与操作系统显示编号一致
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"# 强制 CUDA 操作同步执行，方便调试，但会降低训练速度
+
+import torch
+import torch.nn.functional as F
+
+from data.jacquard_data import JacquardDataset # Jacquard数据集的加载器。负责读取 Jacquard 的 RGB 图、深度图和抓取标签
+from data.grasp_anything_data import GraspAnythingDataset
+
+# 整个项目的核心模型，它封装了SAM作为编码器，并添加了自定义的解码器用于同时预测分割掩码 (Mask) 和抓取位姿 (Grasp Poses)
+from model.planar_grasp_sam import PlanarGraspSAM
+# 一个辅助类，用于在终端优雅地打印训练信息
+from utils.utils import TrainProgress
+# 从 scikit-image 库导入高斯滤波函数
+from skimage.filters import gaussian
+from data.utils.grasp_utils import *
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic algorithms ensure reproducibility but might be slightly slower
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# 计算预测IoU是否>0.25，是返回True，否返回False
+def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, grasp_width=None):
+    """
+    评估模型预测的抓取是否成功
+    Calculate grasp success using the IoU (Jacquard) metric (e.g. in https://arxiv.org/abs/1301.3592)
+    若抓取矩形与真实边界框的 IoU 达到 25% 且角度差在 30 度以内，则计为一次成功。
+    :param grasp_q: GG-CNN 的 Q 输出，质量图
+    :param grasp_angle: GG-CNN 的角度输出，角度图
+    :param ground_truth_bbs: 对应的真实边界框
+    :param no_grasps: 每张图像考虑的最大抓取数
+    :param grasp_width: (可选) GG-CNN 的宽度输出，宽度图
+    :return: success
+    """
+
+    # 确保ground_truth_bbs是GraspRectangles类的实例，如果不是，则转换
+    if not isinstance(ground_truth_bbs, GraspRectangles):
+        gt_bbs = GraspRectangles.load_from_array(ground_truth_bbs)
+    else:
+        gt_bbs = ground_truth_bbs
+
+    # gs 是一个列表，包含预测出的最可能的几个抓取配置
+    gs = detect_grasps(grasp_q, grasp_angle, width_img=grasp_width, no_grasps=no_grasps)
+    # 判断每个抓取配置和真实标签之间的最大iou是否大于0.25
+    for g in gs:
+        if g.max_iou(gt_bbs) > 0.25:
+            return True
+    else:
+        return False
+
+# 将预测结果放大至1024*1024，返回1024*1024大小的q_img, ang_img, width_img
+def post_process_output(q_img, cos_img, sin_img, width_img):
+    """
+    对 GG-CNN 的原始输出进行后处理，转换为 numpy 数组，应用滤波.
+    :param q_img: GG-CNN 的 Q 输出（torch 张量格式）
+    :param cos_img: GG-CNN 的 cos 输出
+    :param sin_img: GG-CNN 的 sin 输出
+    :param width_img: GG-CNN 的宽度输出
+    :return: 滤波后的q_img, ang_img, width_img
+    """
+    if len(q_img.shape) == 3:
+        # 如果输入形状是 (Channels, H, W)，例如 (1, 300, 300)
+        # unsqueeze(0) 增加一个 Batch 维度 -> (1, Channels, H, W)，因为 interpolate 需要 4D 输入
+        # interpolate 做双线性插值放大到 1024x1024
+        # [0] 取出第一个样本，恢复为 (Channels, 1024, 1024)
+        q_img = F.interpolate(q_img.unsqueeze(0), size=(1024, 1024))[0]
+        cos_img = F.interpolate(cos_img.unsqueeze(0), size=(1024, 1024))[0]
+        sin_img = F.interpolate(sin_img.unsqueeze(0), size=(1024, 1024))[0]
+        width_img = F.interpolate(width_img.unsqueeze(0), size=(1024, 1024))[0]
+        
+    elif len(q_img.shape) == 4:
+        # 如果输入已经是 (Batch, Channels, H, W)，直接插值
+        # [0] 同样是为了取出 Batch 中的第一个样本
+        q_img = F.interpolate(q_img, size=(1024, 1024))[0]
+        cos_img = F.interpolate(cos_img, size=(1024, 1024))[0]
+        sin_img = F.interpolate(sin_img, size=(1024, 1024))[0]
+        width_img = F.interpolate(width_img, size=(1024, 1024))[0]
+
+    width_scale = 512
+    # 1. .data.detach().cpu().numpy(): 将张量从计算图分离，移到 CPU，转为 NumPy 数组
+    # 2. .squeeze(): 压缩维度，例如把 (1, 1024, 1024) 变成 (1024, 1024) 的 2D 数组
+    q_img = q_img.data.detach().cpu().numpy().squeeze()
+    # 计算抓取角度 (Angle)。
+    # 公式：Angle = 0.5 * arctan2(sin(2θ), cos(2θ))
+    # 这里的输出通常是 2θ 的形式，除以 2 得到真实的抓取角度 θ
+    ang_img = (torch.atan2(sin_img, cos_img) / 2.0).data.detach().cpu().numpy().squeeze()
+    # 还原抓取宽度
+    # 模型输出的宽度通常是归一化的（0~1），乘以 width_scale (这里是 512) 还原成像素单位的宽度
+    # 这里的 512 意味着最大抓取宽度对应图像的半宽（如果原图是1024的话）
+    width_img = width_img.data.detach().cpu().numpy().squeeze() * width_scale
+    
+    # 对 Q 图（质量图）应用高斯模糊，sigma=2.0
+    # preserve_range=True 保证数值范围不会被改变（比如保持在 0-1 之间）
+    q_img = gaussian(q_img, 2.0, preserve_range=True)
+    # 对角度图应用高斯模糊，平滑角度变化
+    ang_img = gaussian(ang_img, 2.0, preserve_range=True)
+    # 对宽度图应用较小的高斯模糊 (sigma=1.0)，保留更多边缘细节
+    width_img = gaussian(width_img, 1.0, preserve_range=True)
+
+    return q_img, ang_img, width_img
+
+# 计算预测抓取框与真实抓取框的IoU来判断抓取是否成功，并统计成功率和验证损失
+def cal_grasp_ious(test_dataset, model, args):
+    # 创建数据加载器
+    # 注意：batch_size 固定为 1。这是为了方便后续逐张图片计算 IoU 成功率
+    test_loader = torch.utils.data.DataLoader(test_dataset, 1, pin_memory=False, 
+                                               num_workers=4, shuffle=True)
+    ld = len(test_loader)# 数据集总长度
+    # 初始化结果字典，用于累积统计数据
+    results = {"correct": 0, "failed": 0, 
+               "g_loss":0, 
+               "g_losses":{
+                "p_loss": 0,
+                "cos_loss": 0,
+                "sin_loss": 0,
+                "width_loss": 0,
+                },}
+    # 切换模型到评估模式
+    model.eval()
+    with torch.no_grad():
+        for idx, data in enumerate(test_loader):
+            # 解包数据：
+            # images: 输入 RGB 图像
+            # masks: 真实分割掩码（Ground Truth Mask）
+            # grasps: 真实抓取标签（包含位置、角度、宽度等热图）
+            # didx, rot, zoom_factor: 用于后期还原真实抓取框几何信息的元数据
+            images, masks, grasps, didx, rot, zoom_factor = data
+            # 将数据移动到 GPU
+            images = images.to(args.device)    
+            masks = masks.to(args.device)
+            grasps = [g.to(args.device) for g in grasps]# grasps 是列表，需逐个移动
+            
+            # 构建输入 targets 字典
+            # 这里 masks 的关键作用是：模型内部会根据这个 GT Mask 自动采样点（Point）作为提示输入给 SAM
+            targets = {}
+            targets["masks"] = masks
+            targets["grasps"] = grasps    
+            
+            # 【核心推理】调用模型前向传播
+            # 前向传播传入真值信息是为了根据真值伪造输入prompt用于训练
+            # 返回 grasp_pred (抓取热图预测) 和 mask_pred (分割掩码预测)
+            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets)    
+            
+            # 计算损失字典
+            # 参数 2.0, 1.0... 是各部分损失的权重系数 (pos_weight=2.0)，可参考论文说明
+            lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+
+            # 累积总抓取损失 (归一化到每个样本，方便最后看平均值)
+            loss = lossd["g_loss"]
+            results['g_loss'] += loss.item() / ld
+
+            # 累积各分项损失 (位置、角度、宽度等)
+            for ln, l in lossd['g_losses'].items():
+                if ln not in results['g_losses']:
+                    results['g_losses'][ln] = 0
+                results['g_losses'][ln] += l.item() / ld
+
+            # 调用后处理函数
+            # lossd['pred']['pos'] 等是模型的原始预测输出
+            # q_out: 抓取质量图 (Quality/Confidence Map)
+            # ang_out: 抓取角度图 (Angle Map)
+            # w_out: 抓取宽度图 (Width Map)
+            # 注意：这里内部会对 Batch 中第一张图进行插值放大到 1024x1024 并做高斯滤波
+            q_out, ang_out, w_out = post_process_output(lossd['pred']['pos'], lossd['pred']['cos'],
+                                                        lossd['pred']['sin'], lossd['pred']['width'])
+            # calculate_iou_match: 核心评估函数
+            # 1. 从 q_out 热图中找到峰值点（最佳抓取点）。
+            # 2. 结合 ang_out 和 w_out 生成预测的抓取矩形。
+            # 3. test_dataset.get_gtbb(...): 重新从数据集中读取该样本的原始真实抓取框 (Ground Truth Bounding Boxes)。
+            #    传入 didx, rot, zoom_factor 是为了确保取出的真实框应用了和输入图片完全一致的数据增强变换。
+            # 4. 比较预测框和真实框的 IoU。如果 IoU > 0.25 且角度差 < 30度，返回 True
+            success = calculate_iou_match(q_out, ang_out, 
+                                          test_dataset.get_gtbb(didx.item(), rot.item(), zoom_factor.item()), 
+                                          no_grasps=1, 
+                                          grasp_width=w_out)
+            # 统计成功/失败次数
+            if success:
+                results["correct"] += 1
+            else:
+                results["failed"] += 1
+            # 实时计算当前累积成功率 (百分比)
+            success_rate = 100 * results["correct"] / (results["correct"] + results["failed"])
+    # 返回平均抓取损失和最终的成功率
+    return results["g_loss"], success_rate
+
+# 初始化模型函数，调用GraspSAM模型
+def setup_model(model_type, sam_encoder_type, prompt_mode):
+    if model_type == "bs_grasp_sam":
+        model = PlanarGraspSAM(sam_encoder_type=sam_encoder_type, num_layers=0)
+
+    else:
+        raise("please input correct model type")
+
+    return model
+
+
+def main(args):
+    # --- 设置种子 ---
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Random Seed set to: {args.seed}")
+
+    is_save = args.save
+    
+    # 是否保存模型，--save保存，不写就是不保存
+    if is_save:
+        # 设置保存前缀
+        if args.seen:
+            args.exp_name = "seen" + "_" + args.sam_encoder_type + "_" + args.prompt
+            
+        else:
+            args.exp_name = "total" + "_" + args.sam_encoder_type + "_" + args.prompt
+
+        # 生成时间戳，创建唯一的保存路径    
+        exp_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
+        save_path = os.path.join(args.save_dir, args.exp_name, args.dataset_name, '{}'.format(exp_time))
+        
+        # 生成保存的路径
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+
+        # 打开保存路径并写入一个info.txt，记录设置的arg参数信息
+        f = open(os.path.join(save_path, "info.txt"), 'w')
+        f.write(str(args))
+        f.close()
+        
+    # 设定GPU编号，--gpu-num=0就是使用GPU0进行训练
+    args.device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
+        
+    # 根据--dataset-name加载不同的数据集
+    if args.dataset_name == "jacquard":
+        train_dataset = JacquardDataset(root=args.root, crop_size=1024, include_mask=True, 
+                                        random_rotate=False, random_zoom=False,
+                                        seen=True, train=True)
+        test_dataset = JacquardDataset(root=args.root, crop_size=1024, include_mask=True, 
+                                       random_rotate=False, random_zoom=False,   
+                                       seen=False, train=False)
+    
+    elif args.dataset_name == "grasp_anything":
+        # 训练集，seen的0.9部分
+        train_dataset = GraspAnythingDataset(root=args.root, include_mask=True, 
+                                             random_rotate=False, random_zoom=False,
+                                             seen=True, train=True)
+        # 测试集合，unseen的全部，相当于做new列的验证，如果想做base列的验证，应该把seen改成true
+        test_dataset = GraspAnythingDataset(root=args.root, include_mask=True, 
+                                            random_rotate=False, random_zoom=False,
+                                            seen=True, train=False)
+    # 输出训练集和验证集长度        
+    print("train_dataset size : {}".format(train_dataset.__len__()))
+    print("test_dataset size : {}".format(test_dataset.__len__()))
+
+    # 设置 DataLoader 的生成器，确保 shuffle 结果一致
+    g = torch.Generator()
+    if args.seed is not None:
+        g.manual_seed(args.seed)
+
+    # 创建 DataLoader，设置 num_workers=4 进行多线程加载，shuffle=True 打乱数据
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        pin_memory=False, 
+        num_workers=4, 
+        shuffle=True, # 这里虽然是 True，但由下面的 generator 控制随机性
+        worker_init_fn=lambda worker_id: np.random.seed(args.seed + worker_id) if args.seed is not None else None,
+        generator=g if args.seed is not None else None
+    )
+
+    # 初始化模型：PlanarGraspSAM
+    model = setup_model(model_type="bs_grasp_sam", sam_encoder_type=args.sam_encoder_type, prompt_mode=args.prompt)
+
+    # 如果传入了 checkpoint 路径，加载之前的权重继续训练
+    if args.resume_ckp:
+        state_dict = torch.load(args.resume_ckp, map_location='cpu')
+        model.load_state_dict(state_dict['model'], strict=False)
+
+    # 将模型移动到 GPU
+    model.to(args.device)
+    model.train()# 开启训练模式 (启用 Dropout, BatchNorm 更新等)
+
+    # 过滤出需要更新梯度的参数（SAM 的 Encoder 通常是被冻结的，这里只收集 requires_grad=True 的参数）
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    # 使用 AdamW 优化器
+    optimizer = torch.optim.AdamW(parameters, lr=args.lr)
+    # 使用余弦退火学习率调度器 (CosineAnnealingLR)
+    # 学习率会像余弦波一样下降，最低降到 1e-7
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 20, 1e-7)
+    
+    start_epoch = 0
+    
+    # 如果是加载已有权重继续训练，也要恢复优化器和调度器的状态，保证训练连贯性
+    if args.resume_ckp:
+        start_epoch = state_dict['epoch']
+        optimizer.load_state_dict(state_dict['optimizer'])
+        scheduler.load_state_dict(state_dict['scheduler'])
+
+    print("-"*80)
+    
+
+    best_success_rate = 0.0
+    for epoch in range(start_epoch, args.epochs):
+        
+        # 初始化进度条工具
+        t_progress = TrainProgress(train_loader, epoch)
+        for i, data in enumerate(train_loader):
+            # 1. 解包数据
+            images, masks, grasps, _, _, _ = data
+            # 2. 数据移至 GPU
+            images = images.to(args.device)
+            masks = masks.to(args.device)
+            grasps = [g.to(args.device) for g in grasps]
+            # 3. 准备 Targets (用于自动生成提示和计算 Loss)
+            targets = {}
+            targets["masks"] = masks
+            targets["grasps"] = grasps          
+            
+            optimizer.zero_grad()# 清空梯度
+            
+            # 4. 前向传播 (Forward)
+            # 自动利用 targets['masks'] 生成提示点，输入 SAM
+            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets)
+
+            # 5. 计算损失 (Loss)
+            # 计算位置、余弦、正弦、宽度和 Mask 的加权损失
+            lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+            loss = lossd["loss"]
+            # 6. 反向传播 (Backward)
+            loss.backward()
+            # 7. 参数更新 (Step)
+            optimizer.step()
+
+            # 8. 更新日志
+            t_progress.progress_update(lossd, args.batch_size)
+            if i % args.print_freq == 0:
+                t_progress.progress.display(i)
+
+        # 每个 Epoch 结束后更新学习率        
+        scheduler.step()
+        print("-"*80)
+
+        # 只有当前 epoch 大于等于设定的 save_start_epoch 且开启验证时，才进行验证
+        if args.validate and epoch >= args.save_start_epoch:
+            g_loss, success_rate = cal_grasp_ious(test_dataset, model, args)
+            print("epoch : {} / g_loss : {:.4f} / success_rate : {:.4f}".format(epoch, g_loss, success_rate))
+
+            if args.save: 
+                # 保存策略：
+                # 1. 如果当前成功率超过历史最佳
+                # 2. 或者第 0 个 Epoch
+                # 3. 或者每 10 个 Epoch
+                if success_rate > best_success_rate or epoch == 0 or (epoch % 10) == 0:
+                    best_success_rate = success_rate
+                    save_dict = {
+                        "epoch" : epoch,
+                        "model" : model.state_dict(),
+                        "optimizer" : optimizer.state_dict(),
+                        "scheduler" : scheduler.state_dict(),
+                    }
+                    
+                    torch.save(save_dict, os.path.join(save_path, "epoch_%02d_sr_%0.2f.pth" % (epoch, success_rate)))
+                    print("save best model in {}".format(save_path))
+        # 如果不验证，大于等于save_start_epoch时开始保存
+        elif epoch >= args.save_start_epoch:
+            if args.save:
+                save_dict = {
+                        "epoch" : epoch,
+                        "model" : model.state_dict(),
+                        "optimizer" : optimizer.state_dict(),
+                        "scheduler" : scheduler.state_dict(),
+                    }
+                
+                torch.save(save_dict, os.path.join(save_path, "epoch{}.pth".format(str(epoch))))
+                print("save model in {}".format(save_path))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
+    parser.add_argument("--sam-encoder-type", type=str, default="eff_vit_t_w_ad")
+    parser.add_argument("--gpu-num", type=int, default=2, help="gpu id number")
+
+    parser.add_argument("--dataset-name", type=str, default="jacquard", help="dataset name")
+    parser.add_argument("--root", type=str, help="dataset root")
+    parser.add_argument("--seen", action='store_true')
+    parser.add_argument("--prompt", type=str, default='default')
+    
+    parser.add_argument("--lr", type=float, default=1e-5)# 初始学习率
+    parser.add_argument("--epochs", type=int, default=100)# 训练总epoch数
+    parser.add_argument("--batch-size", type=int, default=8)# batch-size
+    parser.add_argument("--print-freq", type=int, default=50)# 每50Batch打印一次信息
+    
+    parser.add_argument("--save", action='store_true')
+    parser.add_argument("--save-dir", type=str, default="final_result")
+    parser.add_argument("--resume-ckp", type=str, default=None)# 如果要继续训练，可指定之前的权重
+
+    parser.add_argument("--validate", action='store_true')
+
+    parser.add_argument("--save-start-epoch", type=int, default=0, help="start saving best model after this epoch")
+    args = parser.parse_args()
+
+    main(args)
+
+```
+
+# train_language.py(手动新增)
+
 ```
 import os
 import time
 import argparse
 import warnings
+import random
+import numpy as np
 
 warnings.filterwarnings(action='ignore')
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -5489,30 +5947,56 @@ import torch.nn.functional as F
 
 from data.jacquard_data import JacquardDataset
 from data.grasp_anything_data import GraspAnythingDataset
-
-
-from model.planar_grasp_sam import PlanarGraspSAM
+from data.grasp_anything_plus_data import GraspAnythingPlusPlusDataset
+from model.planar_grasp_sam_language import PlanarGraspSAM
 from utils.utils import TrainProgress
-
 from skimage.filters import gaussian
 from data.utils.grasp_utils import *
 
-def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, grasp_width=None):
-    """
-    Calculate grasp success using the IoU (Jacquard) metric (e.g. in https://arxiv.org/abs/1301.3592)
-    A success is counted if grasp rectangle has a 25% IoU with a ground truth, and is withing 30 degrees.
-    :param grasp_q: Q outputs of GG-CNN (Nx300x300x3)
-    :param grasp_angle: Angle outputs of GG-CNN
-    :param ground_truth_bbs: Corresponding ground-truth BoundingBoxes
-    :param no_grasps: Maximum number of grasps to consider per image.
-    :param grasp_width: (optional) Width output from GG-CNN
-    :return: success
-    """
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# 权重过滤函数
+def get_clean_state_dict(model):
+    """
+    获取模型的 state_dict，但剔除 CLIP/Text Encoder 相关的权重。
+    通常这些权重是冻结的，且体积很大，没必要重复保存。
+    """
+    raw_state_dict = model.state_dict()
+    clean_state_dict = {}
+    
+    # 这里定义的关键字用于识别不需要保存的层
+    # 根据具体的模型定义，关键词可能是 'clip_model', 'text_encoder', 'bert' 等
+    ignore_keywords = ['clip_model', 'text_encoder', 'clip.'] 
+
+    for k, v in raw_state_dict.items():
+        # 检查参数名中是否包含任何忽略关键词
+        should_ignore = False
+        for keyword in ignore_keywords:
+            if keyword in k:
+                should_ignore = True
+                break
+        
+        if not should_ignore:
+            clean_state_dict[k] = v
+            
+    return clean_state_dict
+
+def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, grasp_width=None):
     if not isinstance(ground_truth_bbs, GraspRectangles):
         gt_bbs = GraspRectangles.load_from_array(ground_truth_bbs)
     else:
         gt_bbs = ground_truth_bbs
+
     gs = detect_grasps(grasp_q, grasp_angle, width_img=grasp_width, no_grasps=no_grasps)
     for g in gs:
         if g.max_iou(gt_bbs) > 0.25:
@@ -5520,22 +6004,12 @@ def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, gra
     else:
         return False
 
-
 def post_process_output(q_img, cos_img, sin_img, width_img):
-    """
-    Post-process the raw output of the GG-CNN, convert to numpy arrays, apply filtering.
-    :param q_img: Q output of GG-CNN (as torch Tensors)
-    :param cos_img: cos output of GG-CNN
-    :param sin_img: sin output of GG-CNN
-    :param width_img: Width output of GG-CNN
-    :return: Filtered Q output, Filtered Angle output, Filtered Width output
-    """
     if len(q_img.shape) == 3:
         q_img = F.interpolate(q_img.unsqueeze(0), size=(1024, 1024))[0]
         cos_img = F.interpolate(cos_img.unsqueeze(0), size=(1024, 1024))[0]
         sin_img = F.interpolate(sin_img.unsqueeze(0), size=(1024, 1024))[0]
         width_img = F.interpolate(width_img.unsqueeze(0), size=(1024, 1024))[0]
-        
     elif len(q_img.shape) == 4:
         q_img = F.interpolate(q_img, size=(1024, 1024))[0]
         cos_img = F.interpolate(cos_img, size=(1024, 1024))[0]
@@ -5546,7 +6020,7 @@ def post_process_output(q_img, cos_img, sin_img, width_img):
     q_img = q_img.data.detach().cpu().numpy().squeeze()
     ang_img = (torch.atan2(sin_img, cos_img) / 2.0).data.detach().cpu().numpy().squeeze()
     width_img = width_img.data.detach().cpu().numpy().squeeze() * width_scale
-
+    
     q_img = gaussian(q_img, 2.0, preserve_range=True)
     ang_img = gaussian(ang_img, 2.0, preserve_range=True)
     width_img = gaussian(width_img, 1.0, preserve_range=True)
@@ -5554,35 +6028,51 @@ def post_process_output(q_img, cos_img, sin_img, width_img):
     return q_img, ang_img, width_img
 
 def cal_grasp_ious(test_dataset, model, args):
-    test_loader = torch.utils.data.DataLoader(test_dataset, 1, pin_memory=False, 
-                                               num_workers=4, shuffle=True)
+    
+    g = torch.Generator()
+    if args.seed is not None:
+        g.manual_seed(args.seed)
+
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, 
+        batch_size=1, 
+        pin_memory=False, 
+        num_workers=4, 
+        shuffle=True, 
+        worker_init_fn=lambda worker_id: np.random.seed(args.seed + worker_id) if args.seed is not None else None,
+        generator=g if args.seed is not None else None
+    )
+
     ld = len(test_loader)
     results = {"correct": 0, "failed": 0, 
                "g_loss":0, 
                "g_losses":{
-                "p_loss": 0,
-                "cos_loss": 0,
-                "sin_loss": 0,
-                "width_loss": 0,
-                },}
+                "p_loss": 0, "cos_loss": 0, "sin_loss": 0, "width_loss": 0,}}
     
     model.eval()
     with torch.no_grad():
         for idx, data in enumerate(test_loader):
-            images, masks, grasps, didx, rot, zoom_factor = data
+            prompts = None
+            if len(data) == 7:
+                images, masks, grasps, didx, rot, zoom_factor, prompts = data
+            else:
+                images, masks, grasps, didx, rot, zoom_factor = data
+
             images = images.to(args.device)    
             masks = masks.to(args.device)
             grasps = [g.to(args.device) for g in grasps]
             
-        
             targets = {}
             targets["masks"] = masks
-            targets["grasps"] = grasps    
-                
-            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets)    
+            targets["grasps"] = grasps
             
+            input_type = "default"
+            if prompts is not None:
+                targets["prompts"] = prompts
+                input_type = "text"
+                
+            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type=input_type)    
             lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
-
 
             loss = lossd["g_loss"]
             results['g_loss'] += loss.item() / ld
@@ -5598,7 +6088,6 @@ def cal_grasp_ious(test_dataset, model, args):
                                           test_dataset.get_gtbb(didx.item(), rot.item(), zoom_factor.item()), 
                                           no_grasps=1, 
                                           grasp_width=w_out)
-            
             if success:
                 results["correct"] += 1
             else:
@@ -5607,68 +6096,73 @@ def cal_grasp_ious(test_dataset, model, args):
             success_rate = 100 * results["correct"] / (results["correct"] + results["failed"])
     return results["g_loss"], success_rate
 
-
 def setup_model(model_type, sam_encoder_type, prompt_mode):
     if model_type == "bs_grasp_sam":
         model = PlanarGraspSAM(sam_encoder_type=sam_encoder_type, num_layers=0)
-
     else:
         raise("please input correct model type")
-
     return model
 
-
 def main(args):
+    
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Random Seed set to: {args.seed}")
+
     is_save = args.save
     
     if is_save:
         if args.seen:
             args.exp_name = "seen" + "_" + args.sam_encoder_type + "_" + args.prompt
-            
         else:
             args.exp_name = "total" + "_" + args.sam_encoder_type + "_" + args.prompt
-            
+
         exp_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
         save_path = os.path.join(args.save_dir, args.exp_name, args.dataset_name, '{}'.format(exp_time))
         
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
-    
+
         f = open(os.path.join(save_path, "info.txt"), 'w')
         f.write(str(args))
         f.close()
         
-
     args.device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
         
-    if args.dataset_name == "jacquard":
-        train_dataset = JacquardDataset(root=args.root, crop_size=1024, include_mask=True, 
-                                        random_rotate=False, random_zoom=False,
-                                        start=0.0, end=0.9, seen=args.seen, train=True)
-        test_dataset = JacquardDataset(root=args.root, crop_size=1024, include_mask=True, 
-                                       random_rotate=False, random_zoom=False,   
-                                       start=0.9, end=1.0, seen=False, train=False)
-    
-    elif args.dataset_name == "grasp_anything":
-        train_dataset = GraspAnythingDataset(root=args.root, include_mask=True, 
-                                             random_rotate=False, random_zoom=False,
-                                             start=0.0, end=0.9, seen=args.seen, train=True)
-        test_dataset = GraspAnythingDataset(root=args.root, include_mask=True, 
-                                            random_rotate=False, random_zoom=False,
-                                            start=0.9, end=1.0, seen=False, train=False)
-            
-    print("train_dataset size : {}".format(train_dataset.__len__()))
-    
+    if args.dataset_name == "grasp_anything_plus":
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, pin_memory=False, num_workers=4, shuffle=True)
+        train_dataset = GraspAnythingPlusPlusDataset(root=args.root, include_mask=True, include_prompt=True,
+            random_rotate=False, random_zoom=False, seen=True, train=True)
+        test_dataset = GraspAnythingPlusPlusDataset(root=args.root, include_mask=True, include_prompt=True,
+            random_rotate=False, random_zoom=False, seen=True, train=False)
     
+        
+        
+    print("train_dataset size : {}".format(train_dataset.__len__()))
+    print("test_dataset size : {}".format(test_dataset.__len__()))
+
+    
+    g = torch.Generator()
+    if args.seed is not None:
+        g.manual_seed(args.seed)
+
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        pin_memory=False, 
+        num_workers=4, 
+        shuffle=True,
+        worker_init_fn=lambda worker_id: np.random.seed(args.seed + worker_id) if args.seed is not None else None,
+        generator=g if args.seed is not None else None
+    )
     
     model = setup_model(model_type="bs_grasp_sam", sam_encoder_type=args.sam_encoder_type, prompt_mode=args.prompt)
 
     if args.resume_ckp:
         state_dict = torch.load(args.resume_ckp, map_location='cpu')
+        # 加载时必须 strict=False，因为保存的模型里缺少了 clip 权重
         model.load_state_dict(state_dict['model'], strict=False)
-
 
     model.to(args.device)
     model.train()
@@ -5678,21 +6172,24 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 20, 1e-7)
     
     start_epoch = 0
-    
     if args.resume_ckp:
         start_epoch = state_dict['epoch']
         optimizer.load_state_dict(state_dict['optimizer'])
         scheduler.load_state_dict(state_dict['scheduler'])
 
     print("-"*80)
-    
 
     best_success_rate = 0.0
+
     for epoch in range(start_epoch, args.epochs):
-        
         t_progress = TrainProgress(train_loader, epoch)
+        
         for i, data in enumerate(train_loader):
-            images, masks, grasps, _, _, _ = data
+            prompts = None
+            if len(data) == 7:
+                images, masks, grasps, idx, rot, zoom_factor, prompts = data
+            else:
+                images, masks, grasps, idx, rot, zoom_factor = data
         
             images = images.to(args.device)
             masks = masks.to(args.device)
@@ -5700,11 +6197,16 @@ def main(args):
 
             targets = {}
             targets["masks"] = masks
-            targets["grasps"] = grasps          
+            targets["grasps"] = grasps
+            if prompts is not None:
+                targets["prompts"] = prompts
             
             optimizer.zero_grad()
             
-            grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets)
+            if prompts is not None:
+                grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type="text")
+            else:
+                grasp_pred, mask_pred = model.total_forward(imgs=images, targets=targets, input_type="default")
 
             lossd = model.compute_loss(grasp_pred, mask_pred, targets, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0)
             loss = lossd["loss"]
@@ -5715,32 +6217,33 @@ def main(args):
             t_progress.progress_update(lossd, args.batch_size)
             if i % args.print_freq == 0:
                 t_progress.progress.display(i)
-                
+
         scheduler.step()
         print("-"*80)
 
-
-        if args.validate:
+        if args.validate and epoch >= args.save_start_epoch:
             g_loss, success_rate = cal_grasp_ious(test_dataset, model, args)
             print("epoch : {} / g_loss : {:.4f} / success_rate : {:.4f}".format(epoch, g_loss, success_rate))
 
             if args.save: 
                 if success_rate > best_success_rate or epoch == 0 or (epoch % 10) == 0:
                     best_success_rate = success_rate
+                    # 使用 get_clean_state_dict 过滤掉 clip 权重
                     save_dict = {
                         "epoch" : epoch,
-                        "model" : model.state_dict(),
+                        "model" : get_clean_state_dict(model),
                         "optimizer" : optimizer.state_dict(),
                         "scheduler" : scheduler.state_dict(),
                     }
                     
                     torch.save(save_dict, os.path.join(save_path, "epoch_%02d_sr_%0.2f.pth" % (epoch, success_rate)))
                     print("save best model in {}".format(save_path))
-        else:
+        elif epoch >= args.save_start_epoch:
             if args.save:
+                # 使用 get_clean_state_dict 过滤掉 clip 权重
                 save_dict = {
                         "epoch" : epoch,
-                        "model" : model.state_dict(),
+                        "model" : get_clean_state_dict(model),
                         "optimizer" : optimizer.state_dict(),
                         "scheduler" : scheduler.state_dict(),
                     }
@@ -5748,921 +6251,49 @@ def main(args):
                 torch.save(save_dict, os.path.join(save_path, "epoch{}.pth".format(str(epoch))))
                 print("save model in {}".format(save_path))
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sam-encoder-type", type=str, default="eff_vit_t_w_ad")
     parser.add_argument("--gpu-num", type=int, default=2, help="gpu id number")
-
     parser.add_argument("--dataset-name", type=str, default="jacquard", help="dataset name")
     parser.add_argument("--root", type=str, help="dataset root")
     parser.add_argument("--seen", action='store_true')
     parser.add_argument("--prompt", type=str, default='default')
-    
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--print-freq", type=int, default=50)
-    
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--print-freq", type=int, default=100)
     parser.add_argument("--save", action='store_true')
     parser.add_argument("--save-dir", type=str, default="final_result")
     parser.add_argument("--resume-ckp", type=str, default=None)
-
     parser.add_argument("--validate", action='store_true')
-    parser.add_argument("--split", default=0.9, type=float)
 
+    parser.add_argument("--save-start-epoch", type=int, default=0, help="start saving best model after this epoch")
+    
+    # [新增] 种子参数
+    parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
+    
     args = parser.parse_args()
 
     main(args)
-
-```
-
-# train_language.py(手动新增)
-
-```
-import os
-import sys
-import random
-import numpy as np
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import clip
-
-from typing import Dict, List, Tuple
-
-from model.utils import LayerNorm2d, MLP, masks_sample_points, masks_to_boxes, masks_noise, dice_loss
-
-
-from model.build_grasp_sam import build_grasp_sam
-
-class SamEncoder(nn.Module):
-    def __init__(self, image_encoder, prompt_encoder, sam_encoder_type):
-        super(SamEncoder, self).__init__()
-        
-        self.image_encoder = image_encoder
-        self.prompt_encoder = prompt_encoder
-        self.sam_encoder_type = sam_encoder_type
-
-    def forward(self, batched_input):
-        
-        input_images = torch.stack([x["image"] for x in batched_input], dim=0)
-        image_embeddings, interm_embeddings = self.image_encoder(input_images)
-        
-        batched_output = []
-        for image_record, curr_embedding in zip(batched_input, image_embeddings):
-            
-            # === 修改开始：检查 point_coords 是否存在 ===
-            sparse_embeddings = None
-            dense_embeddings = None
-
-            if "point_coords" in image_record:
-                if "eff" in self.sam_encoder_type:
-                    sparse_embeddings = self.prompt_encoder(
-                        coords=image_record["point_coords"],
-                        labels=image_record["point_labels"]
-                    )
-                else:
-                    points = (image_record["point_coords"], image_record["point_labels"])
-                    sparse_embeddings, dense_embeddings = self.prompt_encoder(
-                        points=points,
-                        boxes=image_record.get("boxes", None),
-                        masks=image_record.get("mask_inputs", None),
-                    )
-            # === 修改结束 ===
-            
-            # 如果是 text 模式，sparse_embeddings 为 None，
-            # 后续在 PlanarGraspSAM.total_forward 中会使用 CLIP 特征进行填充。
-
-            batched_output.append(
-                {
-                    "encoder_embedding": curr_embedding.unsqueeze(0),
-                    "image_pe": self.prompt_encoder.get_dense_pe(), # 必须保留位置编码
-                    "sparse_embeddings": sparse_embeddings,
-                    "dense_embeddings": dense_embeddings,
-                }
-            )
-
-        return batched_output, interm_embeddings
-
-class ConvGraspHeader(nn.Module):
-    def __init__(self, num_layers=3):
-        super(ConvGraspHeader, self).__init__()
-
-        self.layer = []
-        for i in range(0, num_layers):
-            self.layer.append(nn.Sequential(nn.Conv2d(4, 4, kernel_size=1),
-                              nn.BatchNorm2d(4),
-                              nn.ReLU()))
-        self.early_conv = nn.Sequential(*self.layer)
-
-        self.point_predictor = nn.Conv2d(1, 1, kernel_size=1, bias=False)
-        self.width_predictor = nn.Conv2d(1, 1, kernel_size=1, bias=False)
-        
-        self.cos_predictor   = nn.Conv2d(1, 1, kernel_size=1, bias=False)
-        self.sin_predictor   = nn.Conv2d(1, 1, kernel_size=1, bias=False)
-        
-        self.fusion          = nn.Conv2d(2, 1, kernel_size=1, bias=False)
-        
-        
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-                    
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-                
-
-    def forward(self, x):       # x: [1, 4, 256, 256]
-        
-        if len (self.layer) > 0:
-            x = self.early_conv(x)
-        # pos_out   = F.sigmoid(self.point_predictor(x[:,0]))
-        # width_out = F.sigmoid(self.width_predictor(x[:,1]))
-        pos_out   = F.relu(self.point_predictor(x[:,0]))
-        width_out = F.relu(self.width_predictor(x[:,1]))
-    
-        cos_out   = self.cos_predictor(x[:,2])
-        sin_out   = self.sin_predictor(x[:,3])
-
-        return pos_out, cos_out, sin_out, width_out 
-
-class SamDecoder(nn.Module):
-    def __init__(self, mask_decoder, sam_encoder_type, grasp_header_type, num_layers):
-        super(SamDecoder, self).__init__()
-
-        self.mask_decoder = mask_decoder
-        self.sam_encoder_type = sam_encoder_type
-        
-        self.transformer = self.mask_decoder.transformer
-        self.iou_token = self.mask_decoder.iou_token
-        self.mask_tokens = self.mask_decoder.mask_tokens
-        self.num_mask_tokens = self.mask_decoder.num_mask_tokens
-        
-        
-        if "eff" in sam_encoder_type:
-            self.iou_prediction_head = self.mask_decoder.iou_prediction_head
-            
-            
-            def output_upscaling(upscaled_embedding):
-                for upscaling_layer in self.mask_decoder.final_output_upscaling_layers:
-                    upscaled_embedding = upscaling_layer(upscaled_embedding)
-                return upscaled_embedding
-
-            self.output_upscaling = output_upscaling
-              
-            
-            self.output_hypernetworks_mlps = self.mask_decoder.output_hypernetworks_mlps
-            
-        else:
-            self.iou_prediction_head = self.mask_decoder.iou_prediction_head
-            self.output_upscaling = self.mask_decoder.output_upscaling
-            self.output_hypernetworks_mlps = self.mask_decoder.output_hypernetworks_mlps
-        
-        
-        self.grasp_header_type = grasp_header_type
-        
-        self.num_grasp_queries = 4 
-        transformer_dim=256
-        
-        vit_dim_dict = {"vit_b":768,"vit_l":1024,"vit_h":1280,"vit_t":160, "vit_t_w_ad":160,
-                        "eff_vit_t":192, "eff_vit_s":384, "eff_vit_t_w_ad":192, "eff_vit_s_w_ad":384}
-        
-        vit_dim = vit_dim_dict[sam_encoder_type]
-        
-                
-        self.hf_token = nn.Embedding(1, transformer_dim)
-        self.hf_mlp = MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
-
-        
-        self.num_grasp_tokens = 4
-        self.grasp_token = nn.Embedding(self.num_grasp_tokens, transformer_dim)
-        self.grasp_mlp   = nn.ModuleList([
-                            MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
-                            for i in range(self.num_grasp_tokens)])
-        
-        self.num_hq_tokens = self.num_mask_tokens + 1
-        self.num_total_tokens = self.num_hq_tokens + self.num_grasp_tokens
-
-
-        
-        if 'vit_t' in sam_encoder_type:
-            mid_compress_dim = transformer_dim//2
-            out_compress_dim = transformer_dim//8
-        
-        else:
-            mid_compress_dim = transformer_dim
-            out_compress_dim = transformer_dim//8
-        
-        
-        self.compress_vit_feat = nn.Sequential(
-                                nn.ConvTranspose2d(vit_dim, mid_compress_dim, kernel_size=2, stride=2),
-                                LayerNorm2d(mid_compress_dim),
-                                nn.GELU(), 
-                                nn.ConvTranspose2d(mid_compress_dim, out_compress_dim, kernel_size=2, stride=2))
-        
-        self.compress_vit_feat_g = nn.Sequential(
-                                nn.ConvTranspose2d(vit_dim, mid_compress_dim, kernel_size=2, stride=2),
-                                LayerNorm2d(mid_compress_dim),
-                                nn.GELU(), 
-                                nn.ConvTranspose2d(mid_compress_dim, out_compress_dim, kernel_size=2, stride=2))
-        
-        
-        
-        self.embedding_encoder_mask = nn.Sequential(
-                                nn.ConvTranspose2d(transformer_dim, transformer_dim//4, kernel_size=2, stride=2),
-                                LayerNorm2d(transformer_dim//4),
-                                nn.GELU(),
-                                nn.ConvTranspose2d(transformer_dim//4, transformer_dim//8, kernel_size=2, stride=2))
-
-
-        self.embedding_maskfeature = nn.Sequential(
-                                nn.Conv2d(transformer_dim//8, transformer_dim // 4, 3, 1, 1), 
-                                LayerNorm2d(transformer_dim // 4),
-                                nn.GELU(),
-                                nn.Conv2d(transformer_dim//4, transformer_dim//8, 3, 1, 1))
-
-        
-        self.embedding_encoder_grasp = nn.Sequential(
-                                nn.ConvTranspose2d(transformer_dim, transformer_dim//4, kernel_size=2, stride=2),
-                                LayerNorm2d(transformer_dim // 4),
-                                nn.GELU(),
-                                nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2))
-        
-
-        self.embedding_graspfeature = nn.Sequential(
-                                nn.Conv2d(transformer_dim//8, transformer_dim//4, 3, 1, 1), 
-                                LayerNorm2d(transformer_dim//4),
-                                nn.GELU(),
-                                nn.Conv2d(transformer_dim//4, transformer_dim//8, 3, 1, 1))
-
-        
-        
-        
-        self.grasp_header = ConvGraspHeader(num_layers=num_layers)
-        
-    def predict_grasps(
-        self,
-        image_embeddings,
-        image_pe,
-        sparse_prompt_embeddings,
-        dense_prompt_embeddings,
-        hq_feature,
-        grasp_feature
-    ):
-
-        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight, self.hf_token.weight, self.grasp_token.weight], dim=0) #[7, 256]
-        output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)                                       #[1, 7, 256]
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)                                                              #[1, 11, 256]
-
-    
-        src = torch.repeat_interleave(image_embeddings, tokens.shape[0], dim=0)                                                          #[1, 256, 64, 64]
-        
-        if "eff" in self.sam_encoder_type:
-            pass
-        else:
-            src = src + dense_prompt_embeddings
-        
-        pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
-        b, c, h, w = src.shape
-
-        hs, src = self.transformer(src, pos_src, tokens)            # [B, 21, 256] /[1, 4096, 256]
-        iou_token_out = hs[:, 0, :]                                 # [1, 256]
-        mask_tokens_out = hs[:, 1 : (1 + self.num_total_tokens), :]
-
-        
-        src = src.transpose(1, 2).view(b, c, h, w)   
-        upscaled_embedding_sam = self.output_upscaling(src)
-        upscaled_embedding_hq = self.embedding_maskfeature(upscaled_embedding_sam) + hq_feature
-        upscaled_embedding_grasp = self.embedding_graspfeature(upscaled_embedding_sam) + grasp_feature
-         
-        hyper_in_list = []
-        for i in range(self.num_total_tokens):
-            if i < 4:
-                hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
-            elif i == 4:
-                hyper_in_list.append(self.hf_mlp(mask_tokens_out[:, i, :]))
-            elif i > 4:
-                hyper_in_list.append(self.grasp_mlp[i-5](mask_tokens_out[:, i, :]))
-        
-        hyper_in = torch.stack(hyper_in_list, dim=1)
-        b, c, h, w = upscaled_embedding_sam.shape
-        
-        
-        masks_sam = (hyper_in[:,:4] @ upscaled_embedding_sam.view(b, c, h * w)).view(b, -1, h, w)
-        masks_ours = (hyper_in[:,4] @ upscaled_embedding_hq.view(b, c, h * w)).view(b, -1, h, w)
-        masks = torch.cat([masks_sam,masks_ours],dim=1)
-        
-        iou_pred = self.iou_prediction_head(iou_token_out)
-
-        # grasp = (hyper_in[:, -1] @ upscaled_embedding_grasp.view(b, c, h * w)).view(b, -1, h, w)           #[1, 1, 256, 256]
-        grasp_maps = (hyper_in[:,5:] @ upscaled_embedding_grasp.view(b, c, h * w)).view(b, -1, h, w)
-   
-        grasp = self.grasp_header(grasp_maps)
-
-        return masks, iou_pred, grasp
-    
-
-    def forward(
-        self,
-        image_embeddings: torch.Tensor,
-        image_pe: torch.Tensor,
-        sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
-        multimask_output: bool,
-        interm_embeddings: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Predict masks given image and prompt embeddings.
-
-        Arguments:
-          image_embeddings (torch.Tensor): the embeddings from the ViT image encoder
-          image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
-          sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
-          dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-          multimask_output (bool): Whether to return multiple masks or a single
-            mask.
-
-        Returns:
-          torch.Tensor: batched predicted hq masks
-        """
-        # print(len(interm_embeddings))
-        # print(interm_embeddings[0].shape)
-        # exit()
-        vit_features = interm_embeddings[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
-        hq_features = self.embedding_encoder_mask(image_embeddings) + self.compress_vit_feat(vit_features)
-        grasp_features= self.embedding_encoder_grasp(image_embeddings) + self.compress_vit_feat_g(vit_features) 
-
-        batch_len = len(image_embeddings)
-        masks = []
-        iou_preds = []
-        grasps_pos = []
-        grasps_cos = []
-        grasps_sin = []
-        grasps_width = []
-        
-        for i_batch in range(batch_len):
-            mask, iou_pred, grasp_pred = self.predict_grasps(
-                image_embeddings=image_embeddings[i_batch].unsqueeze(0),
-                image_pe=image_pe[i_batch],
-                sparse_prompt_embeddings=sparse_prompt_embeddings[i_batch],
-                dense_prompt_embeddings=dense_prompt_embeddings[i_batch],
-                hq_feature = hq_features[i_batch].unsqueeze(0),
-                grasp_feature = grasp_features[i_batch].unsqueeze(0)
-            )
-            masks.append(mask)
-            iou_preds.append(iou_pred)
-            grasps_pos.append(grasp_pred[0])
-            grasps_cos.append(grasp_pred[1])
-            grasps_sin.append(grasp_pred[2])
-            grasps_width.append(grasp_pred[3])
-            
-            
-        grasps_poses = torch.cat(grasps_pos,0)
-        grasps_coses = torch.cat(grasps_cos,0)
-        grasps_sines = torch.cat(grasps_sin,0)
-        grasps_widthes = torch.cat(grasps_width,0)
-        
-        grasps = [grasps_poses, grasps_coses, grasps_sines, grasps_widthes]
-    
-        masks = torch.cat(masks,0)
-        iou_preds = torch.cat(iou_preds,0)
-
-        if multimask_output:
-            mask_slice = slice(1,self.num_hq_tokens-1)
-            iou_preds = iou_preds[:, mask_slice]
-            iou_preds, max_iou_idx = torch.max(iou_preds,dim=1)
-            iou_preds = iou_preds.unsqueeze(1)
-            masks_multi = masks[:, mask_slice, :, :]
-            masks_sam = masks_multi[torch.arange(masks_multi.size(0)),max_iou_idx].unsqueeze(1)       
-                 
-        else:
-            mask_slice = slice(0, 1)
-            masks_sam = masks[:,mask_slice]            
-
-        
-        masks_hq = masks[:,slice(self.num_hq_tokens-1, self.num_hq_tokens), :, :]
-        
- 
-        return grasps, masks_hq
-
-class PlanarGraspSAM(nn.Module):
-    def __init__(self, sam_encoder_type, vis=False, num_layers=0):
-        super(PlanarGraspSAM, self).__init__()
-        
-        # 1. 构建基础 SAM 模型
-        self.image_encoder, self.prompt_encoder, self.mask_decoder = build_grasp_sam(sam_encoder_type, adapter=False)
-        self.encoder = SamEncoder(self.image_encoder, self.prompt_encoder, sam_encoder_type)
-        self.decoder = SamDecoder(self.mask_decoder, sam_encoder_type, grasp_header_type="conv", num_layers=num_layers)
-        
-        self.sam_encoder_type = sam_encoder_type
-        self.vis = vis
-        
-        # ================= 新增：CLIP Text Encoder =================
-        print("Loading CLIP model...")
-        # 加载 CLIP 模型 (ViT-B/32 是常用的轻量版本)
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cpu") # 先加载到 CPU，后续转到 device
-        
-        # 冻结 CLIP 参数 (通常不需要微调 CLIP)
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-            
-        # 文本投影层：将 CLIP 的 512 维特征投影到 SAM 的 256 维特征
-        self.prompt_dim = 256  # SAM 默认维度
-        self.clip_dim = 512    # ViT-B/32 输出维度
-        self.text_projector = nn.Linear(self.clip_dim, self.prompt_dim)
-        
-        # 初始化投影层
-        nn.init.kaiming_normal_(self.text_projector.weight, mode='fan_in', nonlinearity='relu')
-        nn.init.constant_(self.text_projector.bias, 0)
-        # ==========================================================
-
-    def total_forward(self, imgs, targets, input_type="text"): # 默认改为 text 或在训练时指定
-        
-        # 1. 准备输入 Image Batch
-        batched_input = []
-        for b_i in range(len(imgs)):
-            dict_input = dict()
-            dict_input['image'] = imgs[b_i]
-            dict_input['original_size'] = imgs[b_i].shape[:2]
-            
-            # 如果是点或框模式，保留原有逻辑
-            if input_type in ['box', 'point', 'default', '1point', '3point', '5point', '10point']:
-                # ... (保留您原有的点/框采样代码) ...
-                # 这里为了简洁省略，请保留您原文件中的点/框处理逻辑
-                pass
-            
-            batched_input.append(dict_input)
-     
-        # 2. 图像编码 (Image Encoding)
-        # batched_output 包含 image_embedding 和 (如果是点框模式的) sparse_embeddings
-        batched_output, interm_embeddings = self.encoder(batched_input)
-        
-        batch_len = len(batched_output)
-        encoder_embedding = torch.cat([batched_output[i_l]['encoder_embedding'] for i_l in range(batch_len)], dim=0)
-        image_pe = [batched_output[i_l]['image_pe'] for i_l in range(batch_len)]
-        dense_embeddings = [batched_output[i_l]['dense_embeddings'] for i_l in range(batch_len)] # 通常为 None 或全零
-
-        # ================= 修改：处理 Prompt Embeddings =================
-        sparse_embeddings = []
-        
-        if input_type == 'text':
-            # 获取文本提示
-            # targets['prompts'] 是一个 tuple (scene_descs, obj_queries)
-            # 我们只需要 obj_queries (例如 "spoon")
-            if "prompts" in targets:
-                # 假设 targets['prompts'] 是 ([desc1, ...], [query1, ...])
-                # 解包并在 batch 维度循环
-                _, obj_queries = targets['prompts'] 
-                
-                # 处理文本编码
-                text_tokens = clip.tokenize(obj_queries).to(imgs.device)
-                
-                with torch.no_grad():
-                    # CLIP 编码 -> (B, 512)
-                    text_features = self.clip_model.encode_text(text_tokens)
-                    text_features = text_features.float() # 半精度转单精度
-                
-                # 投影到 SAM 维度 -> (B, 256)
-                sam_text_features = self.text_projector(text_features)
-                
-                # 调整形状为 Sparse Embedding 格式: (B, 1, 256)
-                # 这里的 1 表示它被视为 1 个 prompt token
-                sparse_embeddings_tensor = sam_text_features.unsqueeze(1)
-                
-                # 分解回 list 以适配后续逻辑
-                for i in range(batch_len):
-                    sparse_embeddings.append(sparse_embeddings_tensor[i:i+1])
-                    
-            else:
-                raise ValueError("Input type is 'text' but no prompts found in targets.")
-                
-        else:
-            # 如果是 box/point 模式，直接使用 encoder 返回的 sparse_embeddings
-            sparse_embeddings = [batched_output[i_l]['sparse_embeddings'] for i_l in range(batch_len)]
-        # ==============================================================
-
-        # 3. 解码 (Decoding)
-        results = self.decoder(
-                    image_embeddings  = encoder_embedding, 
-                    image_pe          = image_pe,
-                    sparse_prompt_embeddings = sparse_embeddings,
-                    dense_prompt_embeddings  = dense_embeddings,
-                    multimask_output=False,
-                    interm_embeddings = interm_embeddings,
-                    )
-        
-        if self.vis:
-            # 返回 prompt 以便可视化
-            if input_type == "text":
-                prompt_input = targets['prompts'][1] # 返回文本 query
-            elif input_type == "point":
-                prompt_input = batched_input[0]['point_coords']
-            elif input_type == "box":
-                prompt_input = batched_input[0]['boxes']
-            else:
-                prompt_input = None
-            return results, prompt_input
-            
-        else:
-            return results
-    
-
-    def weighted_mse(self, preds, targets, masks, weight=0.01):
-        
-        preds = preds.view(-1, 256**2)
-        targets = targets.view(-1, 256**2)
-        masks = masks.view(-1, 256**2)
-        
-        loss = 0
-        for pd, gt, mk in zip(preds, targets, masks):
-            fore_pred = pd[mk>0].clone()
-            fore_gt = gt[mk>0]
-            fore = F.mse_loss(fore_pred, fore_gt)
-        
-            back_pred = pd[mk==0].clone() 
-            back_gt = gt[mk==0]
-            back =  F.mse_loss(back_pred, back_gt)
-            
-            batch_loss = fore + (back * weight)
-            loss += batch_loss
-        
-        mean_loss = loss / masks.shape[0]
-            
-        return mean_loss
-        
-        
-    def compute_loss(self, grasp_pred, mask_pred, target, g_s, m_s, p, c, s, w):
-        g_s = g_s
-        m_s = m_s
-    
-        grasps_gt = target["grasps"]
-        masks_gt = target["masks"]
-        masks_gt = F.interpolate(masks_gt, size=(256, 256))
- 
-        pos_pred, cos_pred, sin_pred, width_pred = grasp_pred
-        
-        pos, cos, sin, width = grasps_gt
-        
-        pos   = F.interpolate(pos, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        cos   = F.interpolate(cos, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        sin   = F.interpolate(sin, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)
-        width = F.interpolate(width, size=(256, 256), mode="bilinear", align_corners=True).squeeze(1)    
-    
-        p_loss = self.weighted_mse(pos_pred, pos, masks_gt)
-        cos_loss = self.weighted_mse(cos_pred, cos, masks_gt)
-        sin_loss = self.weighted_mse(sin_pred, sin, masks_gt)
-        width_loss = self.weighted_mse(width_pred, width, masks_gt)
-    
-        grasp_loss = p*p_loss + c*cos_loss + s*sin_loss + w*width_loss
-    
-        d_loss = dice_loss(mask_pred, masks_gt)
-        bce_loss = F.binary_cross_entropy_with_logits(mask_pred, masks_gt)
-        mask_loss = d_loss + bce_loss
-
-        total_loss = g_s*grasp_loss + m_s*mask_loss
-
-
-        return {
-            "loss": total_loss,
-            "mask_loss" : mask_loss,
-            "g_loss" : grasp_loss,
-            "g_losses":{
-                "p_loss": p_loss,
-                "cos_loss": cos_loss,
-                "sin_loss": sin_loss,
-                "width_loss": width_loss,
-                },
-            "pred":{
-                "pos" : pos_pred,
-                "cos" : cos_pred,
-                "sin" : sin_pred,
-                "width" : width_pred
-
-            }
-        }
-    
-
 ```
 
 训练指令：
 
 ```
-python train_language.py --dataset-name grasp_anything_plus --root /home/wjj2080/Datasets/Grasp-Anything --sam-encoder-type eff_vit_t_w_ad --seen --batch-size 2 --gpu-num 2
+python train_language.py --dataset-name grasp_anything_plus --root /home/wjj2080/Datasets/Grasp-Anything --sam-encoder-type eff_vit_t_w_ad --seen --batch-size 2 --gpu-num 2 --save --validate
 ```
 
+# train_lggcnn.py(手动新增)
 
+```
+
+```
 
 # train_language_part.py(手动新增)
 
 ```
-import os
-import time
-import argparse
-import warnings
-import random
-import numpy as np
 
-warnings.filterwarnings(action='ignore')
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-
-import torch
-import torch.nn.functional as F
-
-# 导入专用的 Part Dataset
-from data.grasp_anything_part_data import GraspAnythingPartDataset
-# 导入专用的 Part Model
-from model.planar_grasp_sam_language_part import PlanarGraspSAMPart
-
-from utils.utils import TrainProgress
-from skimage.filters import gaussian
-from data.utils.grasp_utils import *
-
-# ==============================================================================
-# 1. 辅助函数
-# ==============================================================================
-
-def setup_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-def worker_init_fn(worker_id):
-    np.random.seed(np.random.get_state()[1][0] + worker_id)
-
-def get_clean_state_dict(model):
-    """保存模型时剔除 CLIP 权重"""
-    raw_state_dict = model.state_dict()
-    clean_state_dict = {}
-    # 过滤 CLIP 相关的权重（通常不需要微调，保存体积大）
-    ignore_prefixes = ['clip_model.', 'text_encoder.'] 
-
-    for k, v in raw_state_dict.items():
-        should_ignore = False
-        for prefix in ignore_prefixes:
-            if k.startswith(prefix):
-                should_ignore = True
-                break
-        if not should_ignore:
-            clean_state_dict[k] = v
-    return clean_state_dict
-
-def post_process_output(q_img, cos_img, sin_img, width_img):
-    """后处理：插值放大 -> 转numpy -> 高斯平滑"""
-    if len(q_img.shape) == 3:
-        q_img = F.interpolate(q_img.unsqueeze(0), size=(1024, 1024))[0]
-        cos_img = F.interpolate(cos_img.unsqueeze(0), size=(1024, 1024))[0]
-        sin_img = F.interpolate(sin_img.unsqueeze(0), size=(1024, 1024))[0]
-        width_img = F.interpolate(width_img.unsqueeze(0), size=(1024, 1024))[0]
-    elif len(q_img.shape) == 4:
-        q_img = F.interpolate(q_img, size=(1024, 1024))[0]
-        cos_img = F.interpolate(cos_img, size=(1024, 1024))[0]
-        sin_img = F.interpolate(sin_img, size=(1024, 1024))[0]
-        width_img = F.interpolate(width_img, size=(1024, 1024))[0]
-
-    width_scale = 512
-    q_img = q_img.data.detach().cpu().numpy().squeeze()
-    ang_img = (torch.atan2(sin_img, cos_img) / 2.0).data.detach().cpu().numpy().squeeze()
-    width_img = width_img.data.detach().cpu().numpy().squeeze() * width_scale
-    
-    q_img = gaussian(q_img, 2.0, preserve_range=True)
-    ang_img = gaussian(ang_img, 2.0, preserve_range=True)
-    width_img = gaussian(width_img, 1.0, preserve_range=True)
-
-    return q_img, ang_img, width_img
-
-def calculate_iou_match(grasp_q, grasp_angle, ground_truth_bbs, no_grasps=1, grasp_width=None):
-    """计算抓取成功率 (IoU > 0.25 & Angle < 30 deg)"""
-    if not isinstance(ground_truth_bbs, GraspRectangles):
-        gt_bbs = GraspRectangles.load_from_array(ground_truth_bbs)
-    else:
-        gt_bbs = ground_truth_bbs
-
-    gs = detect_grasps(grasp_q, grasp_angle, width_img=grasp_width, no_grasps=no_grasps)
-    for g in gs:
-        if g.max_iou(gt_bbs) > 0.25:
-            return True
-    return False
-
-def cal_grasp_ious(test_dataset, model, args):
-    """验证循环"""
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=1, pin_memory=False, 
-        num_workers=4, shuffle=True, worker_init_fn=worker_init_fn
-    )
-    ld = len(test_loader)
-    results = {
-        "correct": 0, "failed": 0, "g_loss":0, 
-        "g_losses": {"p_loss": 0, "cos_loss": 0, "sin_loss": 0, "width_loss": 0}
-    }
-    
-    model.eval()
-    with torch.no_grad():
-        for idx, data in enumerate(test_loader):
-            # [修改]: Part Dataset 返回 7 个元素 (vis=False)
-            # x, mask, grasps, idx, rot, zoom_factor, prompt
-            images, masks, grasps, didx, rot, zoom_factor, prompts = data
-
-            images = images.to(args.device)    
-            masks = masks.to(args.device)
-            grasps = [g.to(args.device) for g in grasps]
-            
-            targets = {
-                "masks": masks,
-                "grasps": grasps,
-                "prompts": prompts 
-            }
-            
-            # 前向传播
-            grasp_pred = model.total_forward(imgs=images, targets=targets)    
-            
-            pred_grasps_list, pred_masks = grasp_pred
-            
-            # 重新计算 loss 结构
-            lossd = model.compute_loss(pred_grasps_list, pred_masks, targets)
-
-            results['g_loss'] += lossd["g_loss"].item() / ld
-            for ln, l in lossd['g_losses'].items():
-                results['g_losses'][ln] += l.item() / ld
-
-            # 后处理与评估
-            q_out, ang_out, w_out = post_process_output(
-                lossd['pred']['pos'], lossd['pred']['cos'],
-                lossd['pred']['sin'], lossd['pred']['width']
-            )
-
-            # 获取 GT Bounding Boxes
-            # 注意：因为 DataLoader 没有返回 bbs，我们需要手动获取
-            gt_bbs = test_dataset.get_gtbb(didx.item(), rot.item(), zoom_factor.item())
-            
-            success = calculate_iou_match(q_out, ang_out, gt_bbs, no_grasps=1, grasp_width=w_out)
-            
-            if success: results["correct"] += 1
-            else: results["failed"] += 1
-            
-    success_rate = 100 * results["correct"] / (results["correct"] + results["failed"] + 1e-6)
-    return results["g_loss"], success_rate
-
-# ==============================================================================
-# 2. Main 函数
-# ==============================================================================
-
-def main(args):
-    setup_seed(args.seed)
-    
-    # 设置保存路径
-    if args.save:
-        args.exp_name = f"part_{args.sam_encoder_type}_seen" if args.seen else f"part_{args.sam_encoder_type}_unseen"
-        exp_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
-        save_path = os.path.join(args.save_dir, args.exp_name, "grasp_anything_part", str(exp_time))
-        os.makedirs(save_path, exist_ok=True)
-        with open(os.path.join(save_path, "info.txt"), 'w') as f:
-            f.write(str(args))
-
-    args.device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
-
-    # 1. 加载数据集
-    print(f"Loading GraspAnythingPartDataset (Seen={args.seen})...")
-    
-    train_dataset = GraspAnythingPartDataset(
-        root=args.root, include_mask=True, include_prompt=True,
-        random_rotate=False, random_zoom=False, seen=args.seen, train=True
-    )
-    test_dataset = GraspAnythingPartDataset(
-        root=args.root, include_mask=True, include_prompt=True,
-        random_rotate=False, random_zoom=False, seen=args.seen, train=False
-    )
-    
-    print(f"Train Size: {len(train_dataset)} | Val Size: {len(test_dataset)}")
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, pin_memory=False, 
-        num_workers=4, shuffle=True, worker_init_fn=worker_init_fn
-    )
-
-    # 2. 加载模型
-    print(f"Building PlanarGraspSAMPart ({args.sam_encoder_type})...")
-    model = PlanarGraspSAMPart(sam_encoder_type=args.sam_encoder_type)
-
-    # 恢复权重
-    if args.resume_ckp:
-        print(f"Resuming from {args.resume_ckp}...")
-        state_dict = torch.load(args.resume_ckp, map_location='cpu')
-        model.load_state_dict(state_dict['model'], strict=False) 
-
-    model.to(args.device)
-    model.train()
-
-    # 3. 优化器
-    parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(parameters, lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 20, 1e-7)
-    
-    start_epoch = 0
-    if args.resume_ckp and 'epoch' in state_dict:
-        start_epoch = state_dict['epoch']
-        optimizer.load_state_dict(state_dict['optimizer'])
-        scheduler.load_state_dict(state_dict['scheduler'])
-
-    # 4. 训练循环
-    best_success_rate = 0.0
-    print("Start Training...")
-    print("-" * 80)
-
-    for epoch in range(start_epoch, args.epochs):
-        t_progress = TrainProgress(train_loader, epoch)
-        
-        for i, data in enumerate(train_loader):
-            # [修改]: 解包 7 个元素
-            # images, masks, grasps, idx, rot, zoom_factor, bbs, prompts = data # OLD
-            images, masks, grasps, idx, rot, zoom_factor, prompts = data        # NEW
-            
-            images = images.to(args.device)
-            masks = masks.to(args.device)
-            grasps = [g.to(args.device) for g in grasps]
-
-            targets = {
-                "masks": masks,
-                "grasps": grasps,
-                "prompts": prompts
-            }
-            
-            optimizer.zero_grad()
-            
-            # Forward
-            preds = model.total_forward(imgs=images, targets=targets)
-            
-            # Compute Loss
-            lossd = model.compute_loss(preds[0], preds[1], targets)
-            loss = lossd["loss"]
-            
-            loss.backward()
-            optimizer.step()
-            
-            t_progress.progress_update(lossd, args.batch_size)
-            if i % args.print_freq == 0:
-                t_progress.progress.display(i)
-
-        scheduler.step()
-        print("-" * 80)
-
-        # 验证与保存
-        if epoch >= args.save_start_epoch:
-            if args.validate:
-                print("Validating...")
-                g_loss, success_rate = cal_grasp_ious(test_dataset, model, args)
-                print(f"Epoch: {epoch} | Val Loss: {g_loss:.4f} | Success Rate: {success_rate:.2f}%")
-                
-                if args.save and (success_rate > best_success_rate or epoch % 10 == 0):
-                    best_success_rate = max(best_success_rate, success_rate)
-                    save_dict = {
-                        "epoch": epoch,
-                        "model": get_clean_state_dict(model),
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                    }
-                    torch.save(save_dict, os.path.join(save_path, f"epoch_{epoch:02d}_sr_{success_rate:.2f}.pth"))
-                    print(f"Saved best/checkpoint model to {save_path}")
-            
-            elif args.save:
-                # 仅保存不验证
-                save_dict = {
-                    "epoch": epoch,
-                    "model": get_clean_state_dict(model),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                }
-                torch.save(save_dict, os.path.join(save_path, f"epoch{epoch}.pth"))
-                print(f"Saved model to {save_path}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, required=True, help="dataset root")
-    parser.add_argument("--sam-encoder-type", type=str, default="eff_vit_t_w_ad")
-    parser.add_argument("--gpu-num", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    
-    parser.add_argument("--seen", action='store_true', help="Train on Seen Split")
-    parser.add_argument("--save", action='store_true')
-    parser.add_argument("--validate", action='store_true')
-    parser.add_argument("--save-dir", type=str, default="final_result")
-    parser.add_argument("--save-start-epoch", type=int, default=0)
-    parser.add_argument("--resume-ckp", type=str, default=None)
-    parser.add_argument("--print-freq", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=42)
-
-    args = parser.parse_args()
-    main(args)
 ```
 
 
