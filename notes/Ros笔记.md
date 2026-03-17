@@ -1871,6 +1871,8 @@ cd ~/ros_ur3
 
 ## 2.下载并配置
 
+本机ip需要和ur机械臂处于同一网段，ur机械臂为192.168.0.234，本机ip设置为192.168.0.236
+
 ```
 # 下载下面三个链接的东西，解压放到src里面
 #-----------------------------------------------------
@@ -1888,11 +1890,12 @@ sudo apt-get install ros-noetic-cartesian-trajectory-controller
 
 rosdep install --from-paths src --ignore-src -y
 
-catkin_make_isolated --install
+catkin_make_isolated --install或者catkin build（推荐后者）
 
 source ~/ros_ur3/install_isolated/setup.bash
 # 永久添加到bashrc
 # gedit ~/.bashrc
+# source ~/ros_ur3/devel_isolated/setup.bash或者source ~/ros_ur3/develsetup.bash
 
 # 测试仿真
 方式一：
@@ -1904,13 +1907,227 @@ roslaunch ur3e_moveit_config moveit_rviz.launch
 
 # 连接真实机械臂
 # 第一步，机械臂校准，生成my_ur3e_calibration.yaml校准文件
-roslaunch ur_calibration calibration_correction.launch robot_ip:=192.168.1.102 
+roslaunch ur_calibration calibration_correction.launch robot_ip:=192.168.0.234 
 target_filename:="${HOME}/my_ur3e_calibration.yaml"
 # 第二步，启动并加载校准文件
-roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.1.102 kinematics_config:="${HOME}/my_ur3e_calibration.yaml"
+roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.0.234 kinematics_config:="/home/wjj/.ros/robot_calibration.yaml"
+#（启动后，别忘了在示教器上点击运行external_control程序）
 # 第三步，启动moveit规划
 roslaunch ur3e_moveit_config moveit_planning_execution.launch
 # 第四步，启动rviz
 roslaunch ur3e_moveit_config moveit_rviz.launch
 ```
 
+## 配置方式2尝试
+
+```
+# 1. 创建新工作空间目录并进入 src
+mkdir -p ~/ur_fmauch_ws/src
+cd ~/ur_fmauch_ws
+
+# 2. 拉取你指定的两个仓库
+git clone https://github.com/UniversalRobots/Universal_Robots_ROS_Driver.git src/Universal_Robots_ROS_Driver
+git clone -b calibration_devel https://github.com/fmauch/universal_robot.git src/fmauch_universal_robot
+
+# 3. 更新依赖
+rosdepc update
+rosdep install --from-paths src --ignore-src -y
+
+# 4. 编译
+catkin_make 
+
+# 永久添加到bashrc
+# gedit ~/.bashrc
+# source ~/ur_fmauch_ws/devel/setup.bash
+
+# 后续同方法一
+```
+
+# 深度相机
+
+1. **注册 Intel 服务器的公钥**（让系统信任 Intel 的软件源）：
+
+   ```
+   sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-key F6E65AC044F831AC80A06380C8B3A55A6F3EFCDE || sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-key F6E65AC044F831AC80A06380C8B3A55A6F3EFCDE
+   ```
+
+2. **把 Intel 软件源加入到你的 Ubuntu 中**：
+
+   ```
+   sudo add-apt-repository "deb https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" -u
+   ```
+
+3. **安装底层驱动和测试工具**：
+
+   ```
+   sudo apt-get install librealsense2-dkms librealsense2-utils librealsense2-dev librealsense2-dbg -y
+   ```
+
+4. **脱机测试（见证相机点亮）：** 把 D435i 插上电脑，在终端输入以下命令打开 Intel 官方的可视化工具：
+
+   ```
+   realsense-viewer
+   ```
+
+
+
+1. **安装 ROS 接口和 URDF 描述文件**：
+
+   ```
+   sudo apt install ros-noetic-realsense2-camera ros-noetic-realsense2-description -y
+   ```
+
+2. **在 ROS 中启动相机（关键指令）**： 新开一个终端，运行以下命令：
+
+   ```
+   roslaunch realsense2_camera rs_camera.launch align_depth:=true
+   ```
+
+此时你的相机已经在 ROS 里疯狂发送数据了。让我们把它可视化出来：
+
+1. 新开一个终端，输入 `rviz` 打开可视化界面。
+2. 将左上角的 **Fixed Frame**（固定坐标系）修改为 `camera_link` 或者 `camera_color_optical_frame`。
+3. 点击左下角的 **Add** -> 选 **By topic**：
+   - 找到 `/camera/color/image_raw` -> 点击 `Image` 添加（看彩色画面）。
+   - 找到 `/camera/depth/color/points` -> 点击 `PointCloud2` 添加（看 3D 深度点云）。
+
+## 相机标定
+
+1.准备相机标定板
+
+2.安装ros标定工具
+
+```
+sudo apt install ros-noetic-camera-calibration
+```
+
+3.启动相机和标定程序
+
+```
+roslaunch realsense2_camera rs_camera.launch
+```
+
+这里的参数需要根据你的棋盘格实际情况修改（假设是 8x6 个内角点，每个方块 0.024 米）：
+
+```
+rosrun camera_calibration cameracalibrator.py --size 8x6 --square 0.024 image:=/camera/color/image_raw camera:=/camera/color --no-service-check
+```
+
+运行后默认保存到/tmp/calibrationdata.tar.gz
+
+```
+cp /tmp/calibrationdata.tar.gz ~/
+
+cd ~/
+tar -xvf calibrationdata.tar.gz
+```
+
+解压后提取里面的ost.yaml
+
+```
+mkdir -p ~/ros_ur3/src/ur3_grasping/config
+
+# 把文件移进去，并重命名为更清晰的名字
+
+mv ~/ost.yaml ~/ros_ur3/src/ur3_grasping/config/d435i_color_intrinsic.yaml
+```
+
+将d435i_color_intrinsic.yaml中的camera_name: narrow_stereo修改成camera_name: camera_color_optical_frame
+
+之后就可以带上参数加载相机了
+
+```
+roslaunch realsense2_camera rs_camera.launch align_depth:=true depth_width:=480 depth_height:=270 depth_fps:=15 color_width:=640 color_height:=480 color_fps:=15 color_info_url:="file:///home/wjj/ur_fmauch_ws/src/ur3_grasping/config/d435i_color_intrinsic.yaml"
+```
+
+
+
+## 手眼标定
+
+### 第 1 步：物理准备（打印 ArUco 码）
+
+1. 在电脑上打开这个专门生成标定码的网站：[Online ArUco markers generator](https://chev.me/arucogen/)
+2. 设置如下：
+   - Dictionary: **Original ArUco**
+   - Marker ID: 26（选个吉利的数字，随便填，但要记住）
+   - Marker size: **100 mm** （10厘米，必须非常精确）
+3. 打印出来，用尺子量一下黑框的实际物理边长（如果因为打印机缩放导致不是 10cm，比如是 9.8cm，请记住这个真实数值 `0.098`）。
+4. **固定：** 把这张纸平整地贴在机械臂前方桌面的正中央，用胶带死死固定住，**标定期间绝对不能有一丝一毫的移动**。
+
+### 第 2 步：安装依赖和算法库
+
+```
+sudo apt update
+sudo apt install ros-noetic-aruco-ros ros-noetic-visp-hand2eye-calibration -y
+```
+
+下载 `easy_handeye` 源码
+
+```
+cd ~/ros_ur3/src
+git clone https://github.com/IFL-CAMP/easy_handeye.git
+
+cd ~/ros_ur3
+catkin build
+```
+
+### 第 3 步：编写一键标定 Launch 文件
+
+进入你之前创建好的 `ur3_grasping` 功能包的 `launch` 文件夹（如果没有这个文件夹，就新建一个 `mkdir ~/ros_ur3/src/ur3_grasping/launch`）：
+
+```
+cd ~/ros_ur3/src/ur3_grasping/launch
+gedit ur3_d435i_calibration.launch
+```
+
+将下面的代码复制进去并保存（注意核对你的 `marker_size` 和 `marker_id`）：
+
+```xml
+<launch>
+    <node pkg="aruco_ros" type="single" name="aruco_single">
+        <remap from="/camera_info" to="/camera/color/camera_info" />
+        <remap from="/image" to="/camera/color/image_raw" />
+        <param name="image_is_rectified" value="false"/>
+        <param name="marker_size" value="0.1" /> <param name="marker_id" value="26" />   <param name="reference_frame" value="camera_color_optical_frame" />
+        <param name="camera_frame" value="camera_color_optical_frame" />
+        <param name="marker_frame" value="aruco_marker_frame" />
+    </node>
+
+    <include file="$(find easy_handeye)/launch/calibrate.launch">
+        <arg name="eye_on_hand" value="true" />  <arg name="robot_base_frame" value="base_link" />
+        <arg name="robot_effector_frame" value="tool0" />
+        
+        <arg name="tracking_base_frame" value="camera_color_optical_frame" />
+        <arg name="tracking_marker_frame" value="aruco_marker_frame" />
+        
+        <arg name="move_group" value="manipulator" />
+        <arg name="freehand_robot_movement" value="false" />
+    </include>
+</launch>
+```
+
+### 第 4 步：开始“机械舞”标定流程
+
+这是见证奇迹的时刻，请依次在不同的终端启动以下节点（确保每次都 `source` 了环境变量）：
+
+1. **终端 1（机器人底层）：** 启动真实 UR3 驱动（你之前做过的 `ur3e_bringup.launch`），并在示教器上点击 `External Control` 播放键。
+
+2. **终端 2（机器人大脑）：** 启动 MoveIt (`ur3e_moveit_planning_execution.launch`)。
+
+3. **终端 3（开启相机）：** 启动 D435i (`roslaunch realsense2_camera rs_camera.launch align_depth:=true`)。
+
+4. **终端 4（执行标定）：** 运行我们刚写好的 Launch 文件：
+
+   ```
+   roslaunch ur3_grasping ur3_d435i_calibration.launch
+   ```
+
+**标定界面的操作要领：** 运行终端 4 后，会弹出一个分为好几个面板的图形界面（RQT GUI）。
+
+1. 在界面的 **Image View** 窗口中，你应该能看到相机的实时画面。机械臂目前应该正对着桌子上的 ArUco 码，且码的周围会出现一个 **彩色方框和 XYZ 坐标轴**（说明识别成功）。
+2. 在 **Easy Handeye** 面板中，点击 **Take Sample (采样)**，采集第 1 个点。
+3. 然后在面板里点击 **Next Pose** -> **Plan** -> **Execute**，机械臂会自动变换一个姿态（如果自动规划失败，你可以用 MoveIt 的 RViz 界面手动拖动机械臂变换姿态，只要保证相机始终能看到完整的二维码就行）。
+4. 到达新姿态且二维码识别稳定后，再次点击 **Take Sample**。
+5. **重复这个过程**。让相机从高、低、左倾、右侧、俯视等大约 **15 到 20 个不同的姿态**采集样本。姿态差异越大、越丰富，最后算出来的手眼矩阵越精准。
+6. 采样够了之后，点击 **Compute (计算)**。
+7. 最后点击 **Save (保存)**。标定结果会自动保存为 `.yaml` 文件。
