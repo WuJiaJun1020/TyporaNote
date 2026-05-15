@@ -1943,6 +1943,342 @@ catkin_make
 # 后续同方法一
 ```
 
+# 仿真相关
+
+## 添加相机模型
+
+```
+cd ~/ros_ur3/src
+git clone -b ros1-legacy https://github.com/IntelRealSense/realsense-ros.git
+```
+
+/realsense2_description/urdf/_d435i.urdf.xacro下就是相机模型文件
+
+```xml
+<?xml version="1.0"?>
+<!--
+License: Apache 2.0. See LICENSE file in root directory.
+Copyright(c) 2020 Intel Corporation. All Rights Reserved
+
+This is the URDF model for the Intel RealSense 435i camera, in it's
+aluminum peripherial evaluation case.
+-->
+
+<robot name="sensor_d435i" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find realsense2_description)/urdf/_d435.urdf.xacro"/>
+  <xacro:include filename="$(find realsense2_description)/urdf/_d435i_imu_modules.urdf.xacro"/>
+
+  <xacro:macro name="sensor_d435i" params="parent *origin name:=camera use_nominal_extrinsics:=false">
+    <xacro:sensor_d435 parent="${parent}" name="${name}" use_nominal_extrinsics="${use_nominal_extrinsics}">
+      <xacro:insert_block name="origin" />
+    </xacro:sensor_d435>
+    <xacro:d435i_imu_modules name="${name}" use_nominal_extrinsics="${use_nominal_extrinsics}"/>
+  </xacro:macro>
+</robot>
+```
+
+/home/wjj/ros_ur3/src/universal_robot-noetic-devel/ur_gazebo/urdf下新建ur3e_with_d435i.xacro:
+
+```xml
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur3e_with_d435i">
+
+  <xacro:arg name="joint_limit_params" default=""/>
+  <xacro:arg name="kinematics_params" default=""/>
+  <xacro:arg name="physical_params" default=""/>
+  <xacro:arg name="visual_params" default=""/>
+  <xacro:arg name="transmission_hw_interface" default="hardware_interface/PositionJointInterface"/>
+  <xacro:arg name="safety_limits" default="false"/>
+  <xacro:arg name="safety_pos_margin" default="0.15"/>
+  <xacro:arg name="safety_k_position" default="20"/>
+
+  <xacro:include filename="$(find ur_gazebo)/urdf/ur_macro.xacro"/>
+  <xacro:ur_robot_gazebo
+    prefix=""
+    joint_limits_parameters_file="$(arg joint_limit_params)"
+    kinematics_parameters_file="$(arg kinematics_params)"
+    physical_parameters_file="$(arg physical_params)"
+    visual_parameters_file="$(arg visual_params)"
+    transmission_hw_interface="$(arg transmission_hw_interface)"
+    safety_limits="$(arg safety_limits)"
+    safety_pos_margin="$(arg safety_pos_margin)"
+    safety_k_position="$(arg safety_k_position)"/>
+
+  <link name="world" />
+  <joint name="world_joint" type="fixed">
+    <parent link="world" />
+    <child link="base_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <xacro:include filename="$(find realsense2_description)/urdf/_d435i.urdf.xacro"/>
+
+  <xacro:sensor_d435i parent="tool0" name="camera" use_nominal_extrinsics="true">
+    <origin xyz="0 -0.04 0.01" rpy="0 -1.5708 1.5708"/> 
+  </xacro:sensor_d435i>
+
+  <gazebo reference="camera_color_frame">
+    <sensor type="depth" name="d435i_depth_sensor">
+      <always_on>true</always_on>
+      <update_rate>30.0</update_rate>
+      <camera>
+        <horizontal_fov>1.211258</horizontal_fov>
+        <image>
+          <format>B8G8R8</format>
+          <width>640</width>
+          <height>480</height>
+        </image>
+        <clip>
+          <near>0.1</near>
+          <far>10.0</far>
+        </clip>
+      </camera>
+      <plugin name="camera_plugin" filename="libgazebo_ros_openni_kinect.so">
+        <baseline>0.05</baseline>
+        <alwaysOn>true</alwaysOn>
+        <updateRate>30.0</updateRate>
+        <cameraName>camera</cameraName>
+        <imageTopicName>/camera/color/image_raw</imageTopicName>
+        <cameraInfoTopicName>/camera/color/camera_info</cameraInfoTopicName>
+        <depthImageTopicName>/camera/depth/image_raw</depthImageTopicName>
+        <depthImageCameraInfoTopicName>/camera/depth/camera_info</depthImageCameraInfoTopicName>
+        <pointCloudTopicName>/camera/depth/color/points</pointCloudTopicName> 
+        <frameName>camera_color_optical_frame</frameName>
+        <pointCloudCutoff>0.1</pointCloudCutoff>
+        <pointCloudCutoffMax>10.0</pointCloudCutoffMax>
+      </plugin>
+    </sensor>
+  </gazebo>
+</robot>
+```
+
+/home/wjj/ros_ur3/src/universal_robot-noetic-devel/ur_gazebo/launch下新建ur3e_d435i_gazebo.launch：
+
+```xml
+<?xml version="1.0"?>
+<launch>
+  <arg name="paused" default="true" doc="Starts gazebo in paused mode" />
+  <include file="$(find ur_gazebo)/launch/ur3e_bringup.launch">
+    <arg name="robot_description_file" value="$(find ur_gazebo)/launch/inc/load_ur3e_d435i.launch.xml" />  
+    <arg name="paused" value="$(arg paused)" />
+  </include>
+</launch>
+```
+
+/home/wjj/ros_ur3/src/universal_robot-noetic-devel/ur_gazebo/launch/inc下新建load_ur3e_d435i.launch.xml：
+
+```xml
+<?xml version="1.0"?>
+<launch>
+  <arg name="transmission_hw_interface" default="hardware_interface/PositionJointInterface"/>
+  <arg name="safety_limits" default="false" />
+  <arg name="safety_pos_margin" default="0.15" />
+  <arg name="safety_k_position" default="20" />
+
+  <arg name="joint_limit_params" default="$(find ur_description)/config/ur3e/joint_limits.yaml"/>
+  <arg name="kinematics_params" default="$(find ur_description)/config/ur3e/default_kinematics.yaml"/>
+  <arg name="physical_params" default="$(find ur_description)/config/ur3e/physical_parameters.yaml"/>
+  <arg name="visual_params" default="$(find ur_description)/config/ur3e/visual_parameters.yaml"/>
+
+  <param name="robot_description" command="$(find xacro)/xacro '$(find ur_gazebo)/urdf/ur3e_with_d435i.xacro'
+    transmission_hw_interface:=$(arg transmission_hw_interface)
+    safety_limits:=$(arg safety_limits)
+    safety_pos_margin:=$(arg safety_pos_margin)
+    safety_k_position:=$(arg safety_k_position)
+    joint_limit_params:=$(arg joint_limit_params)
+    kinematics_params:=$(arg kinematics_params)
+    physical_params:=$(arg physical_params)
+    visual_params:=$(arg visual_params)" />
+</launch>
+
+```
+
+修改ur_control.launch.xml：
+
+```xml
+<?xml version="1.0"?>
+<launch>
+  <!--
+    This file 'pretends' to load a driver for a UR robot, by accepting similar
+    arguments and playing a similar role (ie: starting the driver node (in this
+    case Gazebo) and loading the ros_control controllers).
+
+    Some of the arguments to this .launch file will be familiar to those using
+    the ur_robot_driver with their robot.
+
+    Other parameters are specific to Gazebo.
+
+    Note: we spawn and start the ros_control controllers here, as they are,
+    together with gazebo_ros_control, essentially the replacement for the
+    driver which would be used with a real robot.
+  -->
+
+  <!-- Parameters we share with ur_robot_driver -->
+  <arg name="controller_config_file" doc="Config file used for defining the ROS-Control controllers."/>
+  <arg name="controllers" default="joint_state_controller eff_joint_traj_controller"/>
+  <arg name="stopped_controllers" default="joint_group_eff_controller"/>
+
+  <!-- Gazebo parameters -->
+  <arg name="gazebo_model_name" default="robot" doc="The name to give to the model in Gazebo (after spawning it)." />
+  <arg name="gazebo_world" default="worlds/empty.world" doc="The '.world' file to load in Gazebo." />
+  <arg name="gui" default="true" doc="If true, Gazebo UI is started. If false, only start Gazebo server." />
+  <arg name="paused" default="false" doc="If true, start Gazebo in paused mode. If false, start simulation as soon as Gazebo has loaded." />
+  <arg name="robot_description_param_name" default="robot_description" doc="Name of the parameter which contains the robot description (ie: URDF) which should be spawned into Gazebo." />
+  <arg name="spawn_z" default="0.02" doc="At which height the model should be spawned. NOTE: lower values will cause the robot to collide with the ground plane." />
+  <arg name="start_gazebo" default="true" doc="If true, Gazebo will be started. If false, Gazebo will be assumed to have been started elsewhere." />
+
+  <!--Setting initial configuration -->
+  <arg name="initial_joint_positions" default=" -J shoulder_pan_joint 0.0 -J shoulder_lift_joint -1.5708 -J elbow_joint 1.5708 -J wrist_1_joint -1.5708 -J wrist_2_joint -1.5708 -J wrist_3_joint 0.0" doc="Initial joint configuration of the robot"/>
+
+  <!-- Load controller settings -->
+  <rosparam file="$(arg controller_config_file)" command="load"/>
+
+  <!-- Start Gazebo and load the empty world if requested to do so -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch" if="$(arg start_gazebo)">
+    <arg name="world_name" value="$(arg gazebo_world)"/>
+    <arg name="paused" value="$(arg paused)"/>
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <!-- Spawn the model loaded earlier in the simulation just started -->
+  <node name="spawn_gazebo_model" pkg="gazebo_ros" type="spawn_model"
+    args="
+      -urdf
+      -param $(arg robot_description_param_name)
+      -model $(arg gazebo_model_name)
+      -z $(arg spawn_z)
+      $(arg initial_joint_positions)
+      "
+    output="screen" respawn="false" />
+
+  <!-- Load and start the controllers listed in the 'controllers' arg. -->
+  <node name="ros_control_controller_spawner" pkg="controller_manager" type="spawner"
+    args="$(arg controllers)" output="screen" respawn="false" />
+
+  <!-- Load other controllers, but do not start them -->
+  <node name="ros_control_stopped_spawner" pkg="controller_manager" type="spawner"
+    args="--stopped $(arg stopped_controllers)" output="screen" respawn="false" />
+
+</launch>
+```
+
+## 生成物体脚本
+
+/home/wjj/ros_ur3/src/ur3_grasping/scripts下新建spawn_blocks.py：
+
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+from gazebo_msgs.srv import SpawnModel
+from geometry_msgs.msg import Pose, Quaternion
+import random
+
+# 定义简单的 XML 格式的方块模型 (SDF 格式)
+# 这样我们就不用额外创建 .sdf 文件了
+def create_cube_sdf(model_name, r, g, b, size=0.05):
+    """
+    生成一个指定颜色和大小的方块的 XML 字符串。
+    size 的单位是米 (0.05 = 5厘米)。
+    r, g, b 是 0-1 之间的浮点数。
+    """
+    return f"""<?xml version="1.0"?>
+    <sdf version="1.6">
+      <model name="{model_name}">
+        <static>false</static>
+        <link name="link">
+          <inertial>
+            <mass>0.1</mass>
+            <inertia>
+              <ixx>0.00001667</ixx><iyy>0.00001667</iyy><izz>0.00001667</izz>
+            </inertia>
+          </inertial>
+          <collision name="collision">
+            <geometry>
+              <box>
+                <size>{size} {size} {size}</size>
+              </box>
+            </geometry>
+            <surface>
+              <friction>
+                <ode>
+                  <mu>1.0</mu>
+                  <mu2>1.0</mu2>
+                </ode>
+              </friction>
+            </surface>
+          </collision>
+          <visual name="visual">
+            <geometry>
+              <box>
+                <size>{size} {size} {size}</size>
+              </box>
+            </geometry>
+            <material>
+              <ambient>{r} {g} {b} 1</ambient>
+              <diffuse>{r} {g} {b} 1</diffuse>
+            </material>
+          </visual>
+        </link>
+      </model>
+    </sdf>"""
+
+def spawn_model(model_name, model_xml, x, y, z):
+    """调用 Gazebo 的服务来生成模型"""
+    rospy.wait_for_service('/gazebo/spawn_sdf_model')
+    try:
+        spawn_sdf = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
+        
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        # z 轴高度设置为方块边长的一半，让它正好躺在地面上
+        pose.position.z = z 
+        pose.orientation = Quaternion(0, 0, 0, 1) # 默认朝向
+
+        # 调用服务
+        status_msg = spawn_sdf(model_name, model_xml, "", pose, "world")
+        if status_msg.success:
+            rospy.loginfo(f"成功生成模型: {model_name}")
+        else:
+            rospy.logerr(f"生成模型 {model_name} 失败: {status_msg.status_message}")
+
+    except rospy.ServiceException as e:
+        rospy.logerr(f"服务调用失败: {e}")
+
+if __name__ == '__main__':
+    # 初始化 ROS 节点
+    rospy.init_node('dataset_block_spawner')
+
+    # --- 核心配置：方块的位置 ---
+    # 假设你的 UR3e 底座在 (0,0,0)
+    # 机械臂前伸，摄像头垂直向下拍摄的区域大约在 x = 0.3 到 0.5 之间
+    
+    # 我们把三个方块横向排列在 x = 0.4 的位置
+    center_x = 0.4
+    offset_y = 0.125
+    block_size = 0.05 # 5厘米
+    spawn_z = block_size / 2.0 # 中心点高度
+
+    # 1. 生成红色方块 (在中间)
+    red_xml = create_cube_sdf("red_block", 1, 0, 0, block_size)
+    spawn_model("red_block", red_xml, x=center_x, y=0.0+ offset_y, z=spawn_z)
+
+    # 2. 生成绿色方块 (偏左)
+    green_xml = create_cube_sdf("green_block", 0, 1, 0, block_size)
+    spawn_model("green_block", green_xml, x=center_x, y=0.1+ offset_y, z=spawn_z)
+
+    # 3. 生成蓝色方块 (偏右)
+    blue_xml = create_cube_sdf("blue_block", 0, 0, 1, block_size)
+    spawn_model("blue_block", blue_xml, x=center_x, y=-0.1+ offset_y, z=spawn_z)
+
+    print("\n")
+    print("三个数据集方块已成功放置在机械臂前方的地面上！")
+    print("现在你可以启动你的图像采集脚本了。")
+```
+
+
+
 # 深度相机
 
 1. **注册 Intel 服务器的公钥**（让系统信任 Intel 的软件源）：
@@ -2043,6 +2379,12 @@ roslaunch realsense2_camera rs_camera.launch align_depth:=true depth_width:=480 
 
 
 ## 手眼标定
+
+```
+sudo apt install ros-noetic-aruco-ros
+
+pip3 install transforms3d
+```
 
 ### 第 1 步：物理准备（打印 ArUco 码）
 
