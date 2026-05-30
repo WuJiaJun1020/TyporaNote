@@ -58,6 +58,151 @@ roslaunch ur3e_moveit_config moveit_rviz.launch
 
 # 仿真相关
 
+## 调试代码
+
+### click_to_grasp.py
+
+```
+# 1. 启动带相机和夹爪的 UR3e Gazebo 仿真
+roslaunch ur_gazebo ur3e_d435i_robotiq_gazebo.launch
+
+# 2. 启动 MoveIt 规划组
+roslaunch ur3e_robotiq_moveit_config move_group.launch
+
+# 运行点击抓取节点
+rosrun ur3_grasping click_to_grasp.py
+```
+
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import rospy
+import moveit_commander
+import cv2
+import numpy as np
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+
+class ClickToGrasp:
+    def __init__(self):
+        # 1. 初始化 MoveIt 
+        moveit_commander.roscpp_initialize(sys.argv)
+        rospy.init_node('click_to_grasp_node')
+        
+        # 2. 规划组名称通常为 "manipulator"
+        self.arm = moveit_commander.MoveGroupCommander("manipulator")
+        self.bridge = CvBridge()
+        
+        self.color_image = None
+        self.depth_image = None
+        
+        # --- 重要：请确保以下话题名与你在 Rviz 中看到的一致 ---
+        self.color_topic = "/camera/color/image_raw"
+        self.depth_topic = "/camera/depth/image_raw" # 如果 Rviz 里是 aligned 就改回 aligned
+        
+        # 订阅彩色和深度图
+        rospy.Subscriber(self.color_topic, Image, self.image_callback)
+        rospy.Subscriber(self.depth_topic, Image, self.depth_callback)
+        
+        cv2.namedWindow("Grasp_UI")
+        cv2.setMouseCallback("Grasp_UI", self.mouse_click)
+        
+        rospy.loginfo("--- 启动成功！ ---")
+        rospy.loginfo("当前订阅深度话题: %s", self.depth_topic)
+        rospy.loginfo("提示：若点击无反应，请检查 Gazebo 是否处于 Play 状态")
+
+    def mouse_click(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            rospy.loginfo("界面点击坐标: u=%d, v=%d", x, y)
+            self.execute_move(x, y)
+
+    def image_callback(self, msg):
+        self.color_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+    def depth_callback(self, msg):
+        # 自动识别深度编码：16UC1 (mm) 或 32FC1 (m)
+        try:
+            if "32FC" in msg.encoding:
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, "32FC1")
+            else:
+                self.depth_image = self.bridge.imgmsg_to_cv2(msg, "16UC1")
+        except Exception as e:
+            rospy.logerr("深度图转换失败: %s", str(e))
+
+    def execute_move(self, u, v):
+        if self.depth_image is None:
+            rospy.logwarn("尚未获取到深度数据，请检查话题: %s", self.depth_topic)
+            return
+            
+        # 3. 获取深度值并处理无效值
+        z_c = self.depth_image[v, u]
+        
+        # 如果是 16位整数(mm)，转为米；如果是 NaN，跳过
+        if np.isnan(z_c) or z_c == 0:
+            rospy.logwarn("点击点深度无效 (NaN 或 0)")
+            return
+            
+        if self.depth_image.dtype == np.uint16:
+            z_c = float(z_c) / 1000.0
+            
+        rospy.loginfo("目标深度: %.3f 米", z_c)
+
+        # 4. 坐标转换 (手眼相机俯视简化模型)
+        # 假设 D435i 默认参数，你可以根据实际 CameraInfo 微调
+        fx, fy = 615.0, 615.0
+        cx, cy = 320.0, 240.0
+        
+        dx_cam = (u - cx) * z_c / fx
+        dy_cam = (v - cy) * z_c / fy
+
+        # 5. 获取当前位姿并计算目标
+        # 注意：由于相机安装角度，相机坐标系 y 对应机器人 -x，相机 x 对应机器人 y
+        current_pose = self.arm.get_current_pose().pose
+        target_pose = current_pose
+        
+        # 这里是基于“手腕垂直向下”姿态的映射逻辑
+        target_pose.position.x -= dy_cam 
+        target_pose.position.y -= dx_cam
+        
+        rospy.loginfo("规划路径中...")
+        self.arm.set_pose_target(target_pose)
+        
+        # 6. 执行动作
+        success = self.arm.go(wait=True)
+        if success:
+            rospy.loginfo("到达目标上方！")
+            # 可选：进一步下探模拟抓取
+            # target_pose.position.z -= (z_c - 0.1)
+            # self.arm.go(wait=True)
+        else:
+            rospy.logerr("规划失败，目标可能超出机械臂工作空间")
+
+    def run(self):
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            if self.color_image is not None:
+                # 在画面中心画个准星方便对齐
+                display_img = self.color_image.copy()
+                cv2.line(display_img, (320, 0), (320, 480), (0, 255, 0), 1)
+                cv2.line(display_img, (0, 240), (640, 240), (0, 255, 0), 1)
+                cv2.imshow("Grasp_UI", display_img)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            rate.sleep()
+        cv2.destroyAllWindows()
+        moveit_commander.roscpp_shutdown()
+
+if __name__ == '__main__':
+    try:
+        node = ClickToGrasp()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
+```
+
 ## 添加相机模型
 
 ```
@@ -818,7 +963,7 @@ test_grasp.py
 
 import rospy
 import moveit_commander
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Quaternion, PoseStamped
 import sys
 
 class ManualGrasper:
@@ -826,36 +971,114 @@ class ManualGrasper:
         moveit_commander.roscpp_initialize(sys.argv)
         rospy.init_node('manual_grasp_test')
 
+        self.scene = moveit_commander.PlanningSceneInterface()
         self.arm = moveit_commander.MoveGroupCommander("manipulator")
         self.gripper = moveit_commander.MoveGroupCommander("gripper")
         
-        # 允许更小的运动容差
+        # 设置运动参数
         self.arm.set_goal_position_tolerance(0.001)
-        self.arm.set_max_velocity_scaling_factor(0.3)
-        self.arm.set_max_acceleration_scaling_factor(0.3)
+        self.arm.set_max_velocity_scaling_factor(0.1)
+        self.arm.set_max_acceleration_scaling_factor(0.1)
+
+        # 初始关节角度
+        self.home_joints = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
         
-        print("--- 机械臂微调测试工具 ---")
+        # 添加虚拟桌面防止碰撞
+        self.add_table_to_scene()
+        
+        print("--- 机械臂安全控制工具 (已修正姿态突跳) ---")
         print("控制: w/s (x), a/d (y), q/e (z)")
-        print("步进调节: z (变大), x (变小)")
-        print("夹爪: g (闭合), o (打开)")
+        print("步进: z (+), x (-) | 夹爪: g (闭合), o (打开)")
+        print("回归: r (安全回到初始位姿)")
         print("退出: Esc")
 
-    def move_rel(self, dx=0, dy=0, dz=0):
-        current_pose = self.arm.get_current_pose().pose
-        target_pose = current_pose
-        target_pose.position.x += dx
-        target_pose.position.y += dy
-        target_pose.position.z += dz
-        
-        self.arm.set_pose_target(target_pose)
-        # 使用 plan() + execute() 往往比 go() 在微调时更稳定
+    def add_table_to_scene(self):
+        """在 MoveIt 中添加一个虚拟平面代表桌面"""
+        rospy.sleep(1) # 等待场景初始化
+        table_pose = PoseStamped()
+        table_pose.header.frame_id = self.arm.get_planning_frame()
+        table_pose.pose.position.z = -0.01 
+        table_pose.pose.orientation.w = 1.0
+        self.scene.add_box("table", table_pose, size=(2.0, 2.0, 0.01))
+        rospy.loginfo("已将虚拟桌面加入规划场景")
+
+    def go_home(self):
+        """安全回到初始位姿"""
+        print("\n>> 正在规划路径回归初始位姿...")
+        self.arm.set_joint_value_target(self.home_joints)
         success = self.arm.go(wait=True)
+        self.arm.stop()
+        if success:
+            print(">> 已成功回归。")
+        else:
+            print(">> 规划失败，请检查路径是否有障碍。")
+        return success
+
+    def move_rel(self, dx=0, dy=0, dz=0):
+        """相对移动：保持当前姿态不变，仅改变位置"""
+        # 1. 获取当前实时的位姿
+        current_pose = self.arm.get_current_pose().pose
+        
+        target_pose = Pose()
+        # 2. 在当前坐标基础上叠加位移
+        target_pose.position.x = current_pose.position.x + dx
+        target_pose.position.y = current_pose.position.y + dy
+        target_pose.position.z = current_pose.position.z + dz
+        
+        # 3. 【核心修复】直接沿用当前的姿态四元数，防止旋转 90 度
+        target_pose.orientation = current_pose.orientation
+        
+        # 执行规划
+        self.arm.set_pose_target(target_pose)
+        success = self.arm.go(wait=True)
+        self.arm.stop()
+        self.arm.clear_pose_targets()
         return success
 
     def control_gripper(self, value):
+        """夹爪控制：带有阻挡检测的智能抓取"""
         self.gripper.set_joint_value_target([value])
-        self.gripper.go(wait=True)
-        print(">> 夹爪指令已发送: %.2f" % value)
+        print("\n>> 正在发送夹爪指令: %.2f..." % value)
+        
+        # 1. 异步执行，不要阻塞等待 (wait=False)
+        success = self.gripper.go(wait=False)
+        if not success:
+            print(">> 夹爪路径规划失败！")
+            return
+
+        # 2. 监控关节状态，判断是否夹到物体（堵转检测）
+        prev_pos = self.gripper.get_current_joint_values()[0]
+        stall_time = 0.0
+        start_time = rospy.Time.now().to_sec()
+        
+        while not rospy.is_shutdown():
+            rospy.sleep(0.05)  # 50ms 检查一次
+            current_pos = self.gripper.get_current_joint_values()[0]
+            
+            # 判断 1：如果已经顺利到达目标位姿（例如空抓），退出循环
+            if abs(current_pos - value) < 0.01:
+                print(">> 夹爪已到达目标位置。")
+                break
+                
+            # 判断 2：检测是否卡住（夹到物体触发吸附）
+            # 如果关节位置变化极其微小，说明被挡住了
+            if abs(current_pos - prev_pos) < 0.0005:
+                stall_time += 0.05
+                # 如果连续卡住超过 0.2 秒，判定为成功抓取
+                if stall_time > 0.2:
+                    print(">> 检测到夹爪受阻 (成功吸附)，主动停止动作！")
+                    self.gripper.stop()
+                    break
+            else:
+                stall_time = 0.0 # 如果还在动，重置计时器
+                
+            prev_pos = current_pos
+            
+            # 判断 3：安全超时保护（避免死循环，设置个5秒上限）
+            if (rospy.Time.now().to_sec() - start_time) > 5.0:
+                print(">> 夹爪动作超时退出。")
+                self.gripper.stop()
+                break
 
     def run(self):
         import tty, termios
@@ -869,22 +1092,28 @@ class ManualGrasper:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             return ch
 
-        step = 0.01 # 初始步进设为 1cm
+        step = 0.01 
         while not rospy.is_shutdown():
-            print("\r当前步进: %.3f m | 准备就绪..." % step, end="")
+            print("\r当前步进: %.3f m | 输入指令...", end="")
             key = getch()
             
+            # 位置控制
             if key == 'w': self.move_rel(dx=step)
             elif key == 's': self.move_rel(dx=-step)
             elif key == 'a': self.move_rel(dy=step)
             elif key == 'd': self.move_rel(dy=-step)
             elif key == 'q': self.move_rel(dz=step)
             elif key == 'e': self.move_rel(dz=-step)
-            elif key == 'z': step = min(0.1, step + 0.005) # 调大步进
-            elif key == 'x': step = max(0.001, step - 0.005) # 调小步进至 1mm
-            elif key == 'g': self.control_gripper(0.5)
-            elif key == 'o': self.control_gripper(0.0)
-            elif key == '\x1b': break
+            
+            # 功能控制
+            elif key == 'r': self.go_home()
+            elif key == 'z': step = min(0.1, step + 0.005)
+            elif key == 'x': step = max(0.001, step - 0.005)
+            elif key == 'g': self.control_gripper(0.5) # 闭合值根据实际修改
+            elif key == 'o': self.control_gripper(0.0) # 打开值
+            elif key == '\x1b': # Esc 退出
+                print("\n程序退出")
+                break
 
 if __name__ == '__main__':
     try:
@@ -1265,4 +1494,586 @@ rosrun ur3_grasping block_manager.py
 (GraspSAM) wjj@wjj-pc:~$ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libffi.so.7 rosrun ur3_grasping grconvnet_vision_test.py
 
 ```
+
+# 真实机械臂
+
+## 手眼标定
+
+### 创建 3 个 launch 文件：
+
+```
+ur3_grasping/launch/real_realsense.launch
+ur3_grasping/launch/real_aruco.launch
+ur3_grasping/launch/real_handeye_calibration.launch
+```
+
+### real_realsense.launch
+
+```
+<?xml version="1.0"?>
+<launch>
+  <!-- 启动真实 Intel RealSense D435i 相机 -->
+  <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+    <arg name="enable_color" value="true"/>
+    <arg name="enable_depth" value="true"/>
+    <arg name="align_depth" value="true"/>
+
+    <!-- 建议真实标定时固定分辨率和帧率，避免相机参数变化 -->
+    <arg name="color_width" value="640"/>
+    <arg name="color_height" value="480"/>
+    <arg name="color_fps" value="30"/>
+    <arg name="depth_width" value="640"/>
+    <arg name="depth_height" value="480"/>
+    <arg name="depth_fps" value="30"/>
+  </include>
+</launch>
+```
+
+### real_aruco.launch
+
+```
+<?xml version="1.0"?>
+<launch>
+  <!-- 真实相机 ArUco 检测节点 -->
+  <node pkg="aruco_ros" type="single" name="aruco_single" output="screen">
+    <!-- 如果你的 RealSense 话题不同，只需要改这里 -->
+    <remap from="/image" to="/camera/color/image_raw"/>
+    <remap from="/camera_info" to="/camera/color/camera_info"/>
+
+    <!-- image_raw 通常没有去畸变；如果识别不稳定，可以改用 image_rect_color -->
+    <param name="image_is_rectified" value="False"/>
+
+    <!-- 这里必须改成你真实打印的 ArUco 黑色区域边长，单位 m -->
+    <param name="marker_size" value="0.092"/>
+
+    <!-- 你仿真里用的是 id 26，真实打印也建议用 id 26 -->
+    <param name="marker_id" value="26"/>
+
+    <!-- 相机坐标系 -->
+    <param name="reference_frame" value="camera_color_optical_frame"/>
+    <param name="camera_frame" value="camera_color_optical_frame"/>
+
+    <!-- ArUco 检测出来后发布的 marker 坐标系 -->
+    <param name="marker_frame" value="aruco_marker_frame"/>
+  </node>
+</launch>
+```
+
+保持 `real_realsense.launch` 那个终端不要关
+
+<img src="../assests/Ros仿真/image-20260515095512832.png" alt="image-20260515095512832" style="zoom: 50%;" />
+
+```
+roslaunch ur3_grasping real_aruco.launch
+# 查看相机画面
+rqt_image_view
+# 选择话题/aruco_single/result 如果识别成功，你应该能看到图像里 ArUco 上叠加坐标轴
+
+# 如果识别成功，此命令会实时输出 Aruco 码在相机坐标系（camera_color_optical_frame）下的三维坐标和四元数。
+rostopic echo /aruco_single/pose
+
+```
+
+### real_handeye_calibration.launch
+
+```
+<?xml version="1.0"?>
+<launch>
+  <!-- 真实 UR3e + RealSense D435i：眼在手上手眼标定 -->
+  <include file="$(find easy_handeye)/launch/calibrate.launch">
+    <!-- 眼在手上：相机固定在末端/夹爪附近 -->
+    <arg name="eye_on_hand" value="true"/>
+
+    <!-- 保存结果时使用的命名空间，结果会进 ~/.ros/easy_handeye/ -->
+    <arg name="namespace_prefix" value="ur3e_realsense_real_handeyecalibration"/>
+
+    <!-- 机器人基坐标系和末端坐标系 -->
+    <arg name="robot_base_frame" value="base_link"/>
+    <arg name="robot_effector_frame" value="tool0"/>
+
+    <!-- ArUco 检测使用的相机坐标系和 marker 坐标系 -->
+    <arg name="tracking_base_frame" value="camera_color_optical_frame"/>
+    <arg name="tracking_marker_frame" value="aruco_marker_frame"/>
+
+    <!-- 使用 MoveIt 自动运动 -->
+    <arg name="move_group" value="manipulator"/>
+    <arg name="freehand_robot_movement" value="false"/>
+  </include>
+</launch>
+```
+
+
+
+## 1. 启动真实 UR3e 驱动
+```
+roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.0.234 kinematics_config:=/home/wjj/.ros/robot_calibration.yaml
+```
+
+## 2. 示教器上运行 External Control
+
+## 3. 启动 MoveIt
+```
+roslaunch ur3e_moveit_config moveit_planning_execution.launch
+```
+
+## 4. 启动相机和 ArUco 检测
+```
+roslaunch ur3_grasping real_realsense.launch
+roslaunch ur3_grasping real_aruco.launch
+```
+
+## 5. 启动 easy_handeye
+```
+roslaunch ur3_grasping real_handeye_calibration.launch
+```
+
+![image-20260515103302939](../assests/Ros仿真/image-20260515103302939.png)
+
+
+
+## 准备工作
+
+进行标定工作前，先写一个测试代码，测试机械臂的移动，建议先把相机拆了，防止意外
+
+```
+gedit ~/ros_ur3/src/ur3_grasping/scripts/real_arm_keyboard_control.py
+```
+
+```
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import copy
+import math
+import tty
+import termios
+
+import rospy
+import moveit_commander
+
+
+class SafeRealArmKeyboardControl:
+    def __init__(self):
+        moveit_commander.roscpp_initialize(sys.argv)
+        rospy.init_node("real_arm_keyboard_control", anonymous=True)
+
+        self.arm = moveit_commander.MoveGroupCommander("manipulator")
+
+        # 图中初始关节角，单位：degree
+        # shoulder_pan_joint  = 45
+        # shoulder_lift_joint = -90
+        # elbow_joint         = 90
+        # wrist_1_joint       = -90
+        # wrist_2_joint       = -90
+        # wrist_3_joint       = 180
+        self.init_joints_deg = [45.0, -90.0, 90.0, -90.0, -90.0, 180.0]
+        self.init_joints_rad = [math.radians(v) for v in self.init_joints_deg]
+
+        # ====== 安全参数：真实机械臂务必保守 ======
+        self.step = 0.005          # 默认每次移动 5 mm
+        self.min_step = 0.001      # 最小 1 mm
+        self.max_step = 0.020      # 最大 20 mm，不建议再大
+
+        self.vel_scale = 0.03      # 速度 3%
+        self.acc_scale = 0.03      # 加速度 3%
+
+        # 末端工作空间限制，单位 m，base_link 坐标系下的粗略限制
+        # 如果桌面比较高，请把 z_min 改大，例如 0.15 或 0.20
+        self.x_min = -0.60
+        self.x_max = 0.60
+        self.y_min = -0.60
+        self.y_max = 0.60
+        self.z_min = 0.10
+        self.z_max = 0.80
+
+        self.arm.set_max_velocity_scaling_factor(self.vel_scale)
+        self.arm.set_max_acceleration_scaling_factor(self.acc_scale)
+        self.arm.set_goal_position_tolerance(0.002)
+        self.arm.set_goal_orientation_tolerance(0.02)
+        self.arm.set_planning_time(3.0)
+        self.arm.allow_replanning(False)
+
+        rospy.sleep(1.0)
+
+        print("")
+        print("====================================================")
+        print("  真实 UR3e 键盘微调控制程序")
+        print("====================================================")
+        print("  当前程序启动后会先低速回到初始关节姿态")
+        print("  请确认：")
+        print("    1. UR 驱动已启动")
+        print("    2. 示教器 External Control 正在运行")
+        print("    3. MoveIt 已启动")
+        print("    4. 急停按钮在手边")
+        print("")
+        print("  控制按键：")
+        print("    w / s : base_link 坐标系 X 方向 + / -")
+        print("    a / d : base_link 坐标系 Y 方向 + / -")
+        print("    q / e : base_link 坐标系 Z 方向 + / -")
+        print("    z / x : 增大 / 减小步长")
+        print("    r     : 回到图中初始关节姿态")
+        print("    p     : 打印当前末端位姿")
+        print("    Esc   : 退出")
+        print("")
+        print("  默认步长: %.3f m" % self.step)
+        print("  速度比例: %.2f, 加速度比例: %.2f" % (self.vel_scale, self.acc_scale))
+        print("====================================================")
+        print("")
+
+        print("[启动] 程序将先低速回到初始关节姿态。")
+        print("[启动] 请确认真实机械臂周围安全，急停按钮在手边。")
+        rospy.sleep(2.0)
+        self.go_init_pose()
+
+    def getch(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+    def is_pose_safe(self, pose):
+        x = pose.position.x
+        y = pose.position.y
+        z = pose.position.z
+
+        if x < self.x_min or x > self.x_max:
+            print("\n[拒绝] 目标 x=%.3f 超出安全范围 [%.2f, %.2f]" %
+                  (x, self.x_min, self.x_max))
+            return False
+
+        if y < self.y_min or y > self.y_max:
+            print("\n[拒绝] 目标 y=%.3f 超出安全范围 [%.2f, %.2f]" %
+                  (y, self.y_min, self.y_max))
+            return False
+
+        if z < self.z_min or z > self.z_max:
+            print("\n[拒绝] 目标 z=%.3f 超出安全范围 [%.2f, %.2f]" %
+                  (z, self.z_min, self.z_max))
+            return False
+
+        return True
+
+    def print_current_pose(self):
+        pose = self.arm.get_current_pose().pose
+        joints = self.arm.get_current_joint_values()
+
+        print("\n当前末端位姿 base_link -> tool0:")
+        print("  position:")
+        print("    x: %.4f" % pose.position.x)
+        print("    y: %.4f" % pose.position.y)
+        print("    z: %.4f" % pose.position.z)
+        print("  orientation:")
+        print("    x: %.4f" % pose.orientation.x)
+        print("    y: %.4f" % pose.orientation.y)
+        print("    z: %.4f" % pose.orientation.z)
+        print("    w: %.4f" % pose.orientation.w)
+
+        print("当前关节角 degree:")
+        print("  shoulder_pan_joint : %.2f" % math.degrees(joints[0]))
+        print("  shoulder_lift_joint: %.2f" % math.degrees(joints[1]))
+        print("  elbow_joint        : %.2f" % math.degrees(joints[2]))
+        print("  wrist_1_joint      : %.2f" % math.degrees(joints[3]))
+        print("  wrist_2_joint      : %.2f" % math.degrees(joints[4]))
+        print("  wrist_3_joint      : %.2f" % math.degrees(joints[5]))
+
+    def extract_plan(self, plan_result):
+        """
+        兼容不同 MoveIt Python API：
+        有些版本 plan() 返回 RobotTrajectory；
+        有些版本返回 tuple: (success, trajectory, planning_time, error_code)
+        """
+        if isinstance(plan_result, tuple):
+            if len(plan_result) >= 2:
+                success = plan_result[0]
+                trajectory = plan_result[1]
+                if success:
+                    return trajectory
+                return None
+        return plan_result
+
+    def go_init_pose(self):
+        print("\n[提示] 准备回到图中的初始关节姿态。")
+        print("[提示] 目标关节角 degree:", self.init_joints_deg)
+        print("[提示] 请确认路径安全，急停在手边。")
+
+        self.arm.set_max_velocity_scaling_factor(self.vel_scale)
+        self.arm.set_max_acceleration_scaling_factor(self.acc_scale)
+        self.arm.set_joint_value_target(self.init_joints_rad)
+
+        plan_result = self.arm.plan()
+        plan = self.extract_plan(plan_result)
+
+        if plan is None or len(plan.joint_trajectory.points) == 0:
+            print("[失败] 初始姿态规划失败，未执行。")
+            self.arm.clear_pose_targets()
+            return False
+
+        print("[执行] 正在低速回到初始姿态...")
+        success = self.arm.execute(plan, wait=True)
+        self.arm.stop()
+        self.arm.clear_pose_targets()
+
+        if success:
+            print("[完成] 已到达或接近初始姿态。")
+        else:
+            print("[失败] 执行失败。")
+
+        return success
+
+    def retime(self, plan):
+        """
+        重新给轨迹限速，确保真实机械臂不会移动太快。
+        """
+        current_state = self.arm.get_current_state()
+
+        try:
+            return self.arm.retime_trajectory(
+                current_state,
+                plan,
+                velocity_scaling_factor=self.vel_scale,
+                acceleration_scaling_factor=self.acc_scale
+            )
+        except TypeError:
+            try:
+                return self.arm.retime_trajectory(
+                    current_state,
+                    plan,
+                    self.vel_scale
+                )
+            except Exception as e:
+                print("\n[警告] retime_trajectory 失败，使用原始轨迹。错误：%s" % str(e))
+                return plan
+        except Exception as e:
+            print("\n[警告] retime_trajectory 失败，使用原始轨迹。错误：%s" % str(e))
+            return plan
+
+    def compute_cartesian_path_compatible(self, waypoints):
+        """
+        兼容不同 Noetic / MoveIt Python 版本的 compute_cartesian_path。
+
+        你当前机器的签名是：
+            compute_cartesian_path(waypoints, eef_step, avoid_collisions)
+
+        另一类常见签名是：
+            compute_cartesian_path(waypoints, eef_step, jump_threshold)
+        """
+        try:
+            return self.arm.compute_cartesian_path(
+                waypoints,
+                0.002,   # eef_step: 2 mm
+                True     # avoid_collisions
+            )
+        except Exception as e1:
+            try:
+                return self.arm.compute_cartesian_path(
+                    waypoints,
+                    0.002,   # eef_step: 2 mm
+                    0.0      # jump_threshold
+                )
+            except Exception as e2:
+                print("\n[失败] compute_cartesian_path 两种调用方式都失败。")
+                print("第一次错误：%s" % str(e1))
+                print("第二次错误：%s" % str(e2))
+                return None, 0.0
+
+    def move_relative(self, dx=0.0, dy=0.0, dz=0.0):
+        current_pose = self.arm.get_current_pose().pose
+        target_pose = copy.deepcopy(current_pose)
+
+        target_pose.position.x += dx
+        target_pose.position.y += dy
+        target_pose.position.z += dz
+
+        # 姿态完全保持不变，只改变位置，避免末端突然旋转
+        target_pose.orientation = current_pose.orientation
+
+        if not self.is_pose_safe(target_pose):
+            return False
+
+        waypoints = [target_pose]
+        plan, fraction = self.compute_cartesian_path_compatible(waypoints)
+
+        if plan is None:
+            print("\n[失败] 笛卡尔路径规划失败，未执行。")
+            return False
+
+        if fraction < 0.95:
+            print("\n[拒绝] 笛卡尔路径规划不完整，fraction=%.2f，未执行。" % fraction)
+            return False
+
+        if len(plan.joint_trajectory.points) == 0:
+            print("\n[失败] 规划轨迹为空，未执行。")
+            return False
+
+        plan = self.retime(plan)
+
+        print("\n[执行] dx=%.3f, dy=%.3f, dz=%.3f, step=%.3f" %
+              (dx, dy, dz, self.step))
+
+        success = self.arm.execute(plan, wait=True)
+        self.arm.stop()
+        self.arm.clear_pose_targets()
+
+        if success:
+            print("[完成] 小步移动完成。")
+        else:
+            print("[失败] 执行失败。")
+
+        return success
+
+    def run(self):
+        while not rospy.is_shutdown():
+            print("\r当前步长: %.3f m | 等待按键..." % self.step, end="")
+            sys.stdout.flush()
+
+            key = self.getch()
+
+            if key == "w":
+                self.move_relative(dx=self.step)
+            elif key == "s":
+                self.move_relative(dx=-self.step)
+            elif key == "a":
+                self.move_relative(dy=self.step)
+            elif key == "d":
+                self.move_relative(dy=-self.step)
+            elif key == "q":
+                self.move_relative(dz=self.step)
+            elif key == "e":
+                self.move_relative(dz=-self.step)
+
+            elif key == "z":
+                self.step = min(self.max_step, self.step + 0.001)
+                print("\n[步长] 增大到 %.3f m" % self.step)
+
+            elif key == "x":
+                self.step = max(self.min_step, self.step - 0.001)
+                print("\n[步长] 减小到 %.3f m" % self.step)
+
+            elif key == "r":
+                self.go_init_pose()
+
+            elif key == "p":
+                self.print_current_pose()
+
+            elif key == "\x1b":
+                print("\n退出键盘控制程序。")
+                break
+
+            else:
+                print("\n未知按键: %s" % repr(key))
+
+
+if __name__ == "__main__":
+    try:
+        controller = SafeRealArmKeyboardControl()
+        controller.run()
+    except rospy.ROSInterruptException:
+        pass
+    finally:
+        try:
+            moveit_commander.roscpp_shutdown()
+        except Exception:
+            pass
+```
+
+```
+chmod +x ~/ros_ur3/src/ur3_grasping/scripts/real_arm_keyboard_control.py
+```
+
+测试步骤
+
+```
+先启动真实机械臂驱动：
+roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.0.234 kinematics_config:=/home/wjj/.ros/robot_calibration.yaml
+
+示教器上运行：
+External Control
+
+再启动 MoveIt：
+roslaunch ur3e_moveit_config moveit_planning_execution.launch
+
+建议 RViz 也开着观察：
+roslaunch ur3e_moveit_config moveit_rviz.launch
+
+然后启动键盘控制：
+rosrun ur3_grasping real_arm_keyboard_control.py
+```
+
+测试完毕，可以装上相机继续进行手眼标定，把Aruco放在相机下方
+
+```
+# 真实机械臂驱动
+roslaunch ur_robot_driver ur3e_bringup.launch robot_ip:=192.168.0.234 kinematics_config:=/home/wjj/.ros/robot_calibration.yaml
+
+# 示教器 External Control
+
+# MoveIt
+roslaunch ur3e_moveit_config moveit_planning_execution.launch
+
+# 相机
+roslaunch ur3_grasping real_realsense.launch
+
+rqt_image_view
+
+# ArUco 检测
+roslaunch ur3_grasping real_aruco.launch
+
+```
+
+标定完成后查看保存的文件：
+
+```
+cat ~/.ros/easy_handeye/ur3e_realsense_real_handeyecalibration_eye_on_hand.yaml
+```
+
+得到如下结果
+
+```
+wjj@wjj-pc:~$ cat ~/.ros/easy_handeye/ur3e_realsense_real_handeyecalibration_eye_on_hand.yaml
+parameters:
+  eye_on_hand: true
+  freehand_robot_movement: false
+  move_group: manipulator
+  move_group_namespace: /
+  namespace: /ur3e_realsense_real_handeyecalibration_eye_on_hand/
+  robot_base_frame: base_link
+  robot_effector_frame: tool0
+  tracking_base_frame: camera_color_optical_frame
+  tracking_marker_frame: aruco_marker_frame
+transformation:
+  qw: 0.5455018717769727
+  qx: 3.237185283227463e-05
+  qy: 0.011676345092930251
+  qz: -0.8380282631302797
+  x: -0.035555645410803007
+  y: 0.019182341211976803
+  z: 0.02398139988194318
+  
+  translation: 
+  x: -0.01943515748662715
+  y: 0.05426325957809488
+  z: 0.032088723213484716
+rotation: 
+  x: 0.0002877016154526704
+  y: -0.030235435057538118
+  z: -0.9503652685561611
+  w: 0.3096636756496274
+  
+ translation: 
+  x: -0.03159231420922629
+  y: 0.01470667218143697
+  z: 0.020172633944228722
+rotation: 
+  x: -0.004768929771843966
+  y: 0.003887150201229428
+  z: -0.8037547932128815
+  w: 0.5949288863044571
+```
+
+整理并写进代码里在真实机械臂上测试一下是否准确
 
