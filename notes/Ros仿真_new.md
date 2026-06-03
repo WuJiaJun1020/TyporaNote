@@ -1581,15 +1581,31 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose
 import sys
 import threading
-
-# [新增] 导入所需的库
 import serial
 import random
+import math
 
 class VisualCentering:
     def __init__(self):
         moveit_commander.roscpp_initialize(sys.argv)
         rospy.init_node('visual_centering_node')
+
+        # =====================================================================
+        # 【抓取参数与物理映射配置区】 (可在此处随时修改)
+        # =====================================================================
+        self.downward_distance = 0.10  # 默认下压/提取距离：0.10 米 (10cm)
+        
+        # 柔性夹爪物理映射表: (最小像素区间, 最大像素区间, 闭合度 0-100)
+        # 注意：数值 0 代表完全打开，100 代表完全闭合
+        self.grasp_mapping = [
+            (50.0, float('inf'), 50),  # 像素 >= 50 时，闭合度为 50
+            (20.0, 50.0, 80),          # 20 <= 像素 < 50 时，闭合度为 80
+            (0.0,  20.0, 100)          # 0 <= 像素 < 20 时，闭合度为 100 (全闭合)
+        ]
+        
+        self.use_depth_compensation = True  # 是否开启深度补偿探测物体真实高度
+        self.depth_topic = "/camera/depth/image_raw" 
+        # =====================================================================
 
         # 1. 初始化机械臂
         self.arm = moveit_commander.MoveGroupCommander("manipulator")
@@ -1602,10 +1618,12 @@ class VisualCentering:
         
         self.camera_frame = "camera_color_optical_frame"
         self.base_frame = "base_link"
+        self.tool_frame = "tool0"
 
         # 2. 视觉与映射参数
         self.bridge = CvBridge()
         self.color_image = None
+        self.depth_image = None
         
         self.cx = None 
         self.cy = None 
@@ -1613,14 +1631,22 @@ class VisualCentering:
         self.fy = None 
         self.Zc = None
         
-        # [新增] 蓝牙串口初始化参数设置
+        # 蓝牙串口初始化
         self.serial_port = '/dev/rfcomm0'
         self.baud_rate = 9600
         self.ble_serial = None
         self.init_bluetooth()
         
-        # 订阅相机内参话题
+        # 交互模式状态机
+        self.mode = 'normal'
+        self.click_points = []
+        self.current_grasp_width = None
+        
+        # 订阅相机内参、彩色图、深度图
         rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.info_callback)
+        rospy.Subscriber("/camera/color/image_raw", Image, self.color_callback, queue_size=1, buff_size=2**24)
+        rospy.Subscriber(self.depth_topic, Image, self.depth_callback, queue_size=1, buff_size=2**24)
+        
         rospy.loginfo("=============================================")
         rospy.loginfo("正在等待读取相机的真实内参 (fx, fy, cx, cy)...")
         rospy.loginfo("=============================================")
@@ -1633,29 +1659,20 @@ class VisualCentering:
         self.go_home()
 
         rospy.sleep(0.5) 
-        try:
-            trans = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
-            self.Zc = trans.transform.translation.z 
-            rospy.loginfo("=============================================")
-            rospy.loginfo(">> 成功自动计算启动拍摄深度 Zc (到地板距离): %.4f 米", self.Zc)
-            rospy.loginfo("=============================================")
-        except Exception as e:
-            rospy.logwarn("启动时自动获取 Zc 失败 (TF未就绪)，将在双击定位时尝试动态获取: %s", e)
-
+        
         # 4. 开启交互窗口
         cv2.namedWindow("Visual_Centering")
         cv2.setMouseCallback("Visual_Centering", self.mouse_click)
         
-        rospy.Subscriber("/camera/color/image_raw", Image, self.image_callback, queue_size=1, buff_size=2**24)
-        
-        rospy.loginfo("--- 视觉定位节点已启动 ---")
-        rospy.loginfo("请在弹出的画面中【双击左键】目标，机械臂将自动对准！")
-        rospy.loginfo("按【R】键回归拍照位，按【G】键发送蓝牙随机数，按【Q】键退出。")
+        rospy.loginfo("--- 视觉定位与严谨抓取流程节点已启动 ---")
+        rospy.loginfo("【1. 绘制】: 按 L 键进入绘制模式，点击两点确定抓取线。")
+        rospy.loginfo("【2. 对准】: 等待 3s 视觉对准 -> 等待 3s 末端对准 (已开启深度补偿)")
+        rospy.loginfo("【3. 下压】: 到位后按 D 键，机械臂将严格垂直下压 %.2fm。" % self.downward_distance)
+        rospy.loginfo("【4. 抓取】: 按 G 键发送指令，等待2秒夹紧后自动提起 %.2fm。" % self.downward_distance)
+        rospy.loginfo("【  复位】: 随时按 R 键张开夹爪并回归拍照位。")
 
-    # [新增] 蓝牙串口初始化函数
     def init_bluetooth(self):
         try:
-            # 参考 ble_test.py 串口打开方式 [cite: 6, 7]
             self.ble_serial = serial.Serial(
                 port=self.serial_port,
                 baudrate=self.baud_rate,
@@ -1667,103 +1684,128 @@ class VisualCentering:
             )
             rospy.loginfo(f"[OK] 蓝牙串口 {self.serial_port} 初始化成功！")
         except serial.SerialException as e:
-            rospy.logwarn(f"[WARN] 无法打开蓝牙串口 {self.serial_port}，请确认蓝牙已连接且绑定了 rfcomm0。异常: {e}")
+            rospy.logwarn(f"[WARN] 无法打开蓝牙串口 {self.serial_port}，请确认蓝牙已连接。异常: {e}")
 
-    # [新增] 生成随机数并通过蓝牙发送
-    def send_ble_random(self):
+    def send_ble_command(self, value):
         if self.ble_serial and self.ble_serial.is_open:
-            # 生成 0 - 100 的随机数
-            rand_val = random.randint(0, 100)
-            # 参考 ble_test.py 追加换行符 [cite: 9]
-            msg = f"{rand_val}\r\n"
+            msg = f"{int(value)}\r\n"
             try:
-                # 参考 ble_test.py 发送数据逻辑 [cite: 9]
                 self.ble_serial.write(msg.encode("utf-8"))
                 self.ble_serial.flush()
-                rospy.loginfo(f"[TX] 成功发送蓝牙数据: {rand_val}")
+                rospy.loginfo(f"[TX] 成功发送夹爪控制指令: {int(value)}")
+                return True
             except serial.SerialException as e:
                 rospy.logerr(f"[WARN] 蓝牙发送失败 (可能已断开): {e}")
+                return False
         else:
-            rospy.logwarn("[WARN] 蓝牙串口未连接，无法发送数据。请先执行蓝牙绑定操作。")
+            rospy.logwarn("[WARN] 蓝牙串口未连接，无法发送数据。")
+            return False
+
+    def calculate_grasp_value(self, pixel_width):
+        for min_px, max_px, grasp_val in self.grasp_mapping:
+            if min_px <= pixel_width < max_px:
+                return grasp_val
+        return 50  
 
     def info_callback(self, msg):
         if self.fx is None:
-            self.fx = msg.K[0]  
-            self.cx = msg.K[2]  
-            self.fy = msg.K[4]  
-            self.cy = msg.K[5]  
-            
-            rospy.loginfo(">> 成功动态获取相机内参:")
-            rospy.loginfo("   fx: %.2f, fy: %.2f", self.fx, self.fy)
-            rospy.loginfo("   cx: %.2f, cy: %.2f", self.cx, self.cy)
+            self.fx = msg.K[0]; self.cx = msg.K[2]  
+            self.fy = msg.K[4]; self.cy = msg.K[5]  
+
+    def color_callback(self, msg):
+        try: self.color_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e: rospy.logerr("彩色图像转换失败: %s", e)
+
+    def depth_callback(self, msg):
+        try: self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception as e: rospy.logerr("深度图像转换失败: %s", e)
 
     def go_home(self):
         self.arm.set_joint_value_target(self.home_joints)
         success = self.arm.go(wait=True)
         self.arm.stop()
-        
         rospy.sleep(0.2) 
         current_pose = self.arm.get_current_pose().pose
         self.safe_orientation = current_pose.orientation
-        
-        if not success:
-            rospy.logwarn("MoveIt 返回未完全成功 (通常是因为已在目标位置或容差超时)。已强制获取当前姿态。")
-            
         return success
 
-    def image_callback(self, msg):
-        try:
-            self.color_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            rospy.logerr("图像转换失败: %s", e)
-
     def mouse_click(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDBLCLK:
-            rospy.loginfo("检测到点击坐标: u=%d, v=%d", x, y)
-            
-            move_thread = threading.Thread(target=self.execute_centering, args=(x, y))
-            move_thread.daemon = True
-            move_thread.start()
+        if self.mode == 'normal':
+            if event == cv2.EVENT_LBUTTONDBLCLK:
+                threading.Thread(target=self.execute_centering, args=(x, y), daemon=True).start()
+                
+        elif self.mode == 'draw':
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.click_points.append((x, y))
+                if len(self.click_points) == 2:
+                    p1 = self.click_points[0]
+                    p2 = self.click_points[1]
+                    c_x = (p1[0] + p2[0]) / 2.0
+                    c_y = (p1[1] + p2[1]) / 2.0
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    
+                    self.current_grasp_width = math.sqrt(dx**2 + dy**2)
+                    alpha = math.atan2(dy, dx)
+                    
+                    rospy.loginfo(f"抓取线绘制完成 - 中心:({c_x:.1f}, {c_y:.1f})")
+                    self.mode = 'waiting_cam'
+                    threading.Thread(target=self.grasping_workflow_engine, args=(c_x, c_y, alpha), daemon=True).start()
+
+    def get_actual_depth(self, target_u, target_v):
+        target_Zc = None
+        if self.use_depth_compensation and self.depth_image is not None:
+            try:
+                v, u = int(target_v), int(target_u)
+                if 0 <= v < self.depth_image.shape[0] and 0 <= u < self.depth_image.shape[1]:
+                    d_val = self.depth_image[v, u]
+                    if not np.isnan(d_val) and d_val > 0.001:
+                        if self.depth_image.dtype == np.uint16:
+                            target_Zc = d_val / 1000.0  
+                        else:
+                            target_Zc = float(d_val)
+                        rospy.loginfo(f"[*] 深度补偿成功: Zc = {target_Zc:.4f}m")
+            except Exception as e:
+                rospy.logerr(f"深度读取异常: {e}")
+
+        if target_Zc is None:
+            try:
+                trans = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
+                target_Zc = trans.transform.translation.z
+            except:
+                return None
+        return target_Zc
+
+    def grasping_workflow_engine(self, c_x, c_y, alpha):
+        rospy.loginfo(">> 3 秒后开始【视觉中心对准】...")
+        rospy.sleep(3.0)
+        self.click_points = []   
+        self.mode = 'moving_cam' 
+        
+        if self.execute_advanced_centering(c_x, c_y, alpha):
+            rospy.loginfo(">> 保持 3 秒，随后自动执行【末端对准】...")
+            self.mode = 'waiting_gripper'
+            rospy.sleep(3.0)
+            self.mode = 'moving_gripper'
+            self.execute_ee_alignment()
+        else:
+            self.mode = 'normal'
 
     def execute_centering(self, target_u, target_v):
-        if self.safe_orientation is None:
-            rospy.logwarn("未获取到安全姿态，拒绝移动。")
-            return
-
-        if self.fx is None or self.fy is None:
-            rospy.logwarn("尚未获取到相机内参，正在等待，请稍后再试！")
-            return
-
-        try:
-            trans = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
-            self.Zc = trans.transform.translation.z
-        except Exception as e:
-            rospy.logerr("动态获取相机高度 Zc 失败: %s", e)
-            if self.Zc is None:
-                return
-            rospy.logwarn("无法获取实时高度，将复用历史高度 Zc: %.4f 米", self.Zc)
+        if self.safe_orientation is None or self.fx is None: return
+        self.Zc = self.get_actual_depth(target_u, target_v)
+        if self.Zc is None: return
 
         delta_u = target_u - self.cx
         delta_v = target_v - self.cy
-        
         move_x_cam = (delta_u * self.Zc) / self.fx
         move_y_cam = (delta_v * self.Zc) / self.fy
-        
-        rospy.loginfo("=============================================")
-        rospy.loginfo(">> 当前定位使用的 Zc (到地板距离): %.4f 米", self.Zc)
-        rospy.loginfo("像素偏差: du=%.1f, dv=%.1f -> 物理移动: dx=%.3fm, dy=%.3fm", 
-                      delta_u, delta_v, move_x_cam, move_y_cam)
-        rospy.loginfo("=============================================")
 
-        try:
-            trans = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
-        except Exception as e:
-            rospy.logerr("TF 失败: %s", e)
-            return
+        try: trans = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
+        except: return
 
         q = [trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w]
         rot_matrix = tf_trans.quaternion_matrix(q)
-        
         v_cam = np.array([move_x_cam, move_y_cam, 0.0, 0.0])
         v_base = np.dot(rot_matrix, v_cam)
 
@@ -1774,14 +1816,138 @@ class VisualCentering:
         target_pose.position.z = current_pose.position.z 
         target_pose.orientation = self.safe_orientation  
 
-        rospy.loginfo("正在移动机械臂对准目标...")
         self.arm.set_pose_target(target_pose)
-        success = self.arm.go(wait=True)
+        self.arm.go(wait=True)
         self.arm.stop()
         self.arm.clear_pose_targets()
+
+    def execute_advanced_centering(self, target_u, target_v, alpha):
+        if self.safe_orientation is None or self.fx is None: return False
+        self.Zc = self.get_actual_depth(target_u, target_v)
+        if self.Zc is None: return False
+
+        delta_u = target_u - self.cx
+        delta_v = target_v - self.cy
+        move_x_cam = (delta_u * self.Zc) / self.fx
+        move_y_cam = (delta_v * self.Zc) / self.fy
         
-        if success:
-            rospy.loginfo("到达目标上方！你可以继续微调，或按 R 键重置。")
+        try:
+            pose = self.arm.get_current_pose().pose
+            T_ee_base = tf_trans.quaternion_matrix([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+            T_ee_base[0:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+
+            trans_cam_ee = self.tf_buffer.lookup_transform(self.tool_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
+            T_cam_ee = tf_trans.quaternion_matrix([trans_cam_ee.transform.rotation.x, trans_cam_ee.transform.rotation.y, trans_cam_ee.transform.rotation.z, trans_cam_ee.transform.rotation.w])
+            T_cam_ee[0:3, 3] = [trans_cam_ee.transform.translation.x, trans_cam_ee.transform.translation.y, trans_cam_ee.transform.translation.z]
+
+            T_cam_base = np.dot(T_ee_base, T_cam_ee)
+            T_trans = np.eye(4)
+            T_trans[0, 3] = move_x_cam
+            T_trans[1, 3] = move_y_cam
+            T_rot = tf_trans.rotation_matrix(alpha, (0, 0, 1))
+            
+            T_cam_target = np.dot(np.dot(T_cam_base, T_trans), T_rot)
+            T_ee_target = np.dot(T_cam_target, tf_trans.inverse_matrix(T_cam_ee))
+
+            target_pose = Pose()
+            target_pose.position.x = T_ee_target[0, 3]
+            target_pose.position.y = T_ee_target[1, 3]
+            target_pose.position.z = T_ee_target[2, 3]
+            
+            q_target = tf_trans.quaternion_from_matrix(T_ee_target)
+            target_pose.orientation.x = q_target[0]
+            target_pose.orientation.y = q_target[1]
+            target_pose.orientation.z = q_target[2]
+            target_pose.orientation.w = q_target[3]
+
+            self.arm.set_pose_target(target_pose)
+            success = self.arm.go(wait=True)
+            self.arm.stop()
+            self.arm.clear_pose_targets()
+            return success
+        except Exception as e:
+            rospy.logerr("高级定位执行失败: %s", e)
+            return False
+
+    def execute_ee_alignment(self):
+        try:
+            trans_base_cam = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rospy.Time(0), rospy.Duration(1.0))
+            cam_x_in_base = trans_base_cam.transform.translation.x
+            cam_y_in_base = trans_base_cam.transform.translation.y
+            
+            current_ee_pose = self.arm.get_current_pose().pose
+            
+            target_pose = Pose()
+            target_pose.position.x = cam_x_in_base
+            target_pose.position.y = cam_y_in_base
+            target_pose.position.z = current_ee_pose.position.z
+            target_pose.orientation = current_ee_pose.orientation 
+            
+            self.arm.set_pose_target(target_pose)
+            success = self.arm.go(wait=True)
+            self.arm.stop()
+            self.arm.clear_pose_targets()
+            
+            if success:
+                rospy.loginfo(">> 末端对准完成！按下【D】键执行垂直下压。")
+                self.mode = 'ready_to_press'
+            else:
+                self.mode = 'normal'
+        except Exception as e:
+            self.mode = 'normal'
+
+    def execute_downward_press(self):
+        self.mode = 'moving_down'
+        current_pose = self.arm.get_current_pose().pose
+        target_pose = Pose()
+        target_pose.position.x = current_pose.position.x
+        target_pose.position.y = current_pose.position.y
+        target_pose.position.z = current_pose.position.z - self.downward_distance
+        target_pose.orientation = current_pose.orientation
+
+        waypoints = [target_pose]
+        (plan, fraction) = self.arm.compute_cartesian_path(waypoints, 0.01, True)
+        
+        if fraction >= 0.95:
+            if self.arm.execute(plan, wait=True):
+                rospy.loginfo(">> 下压到位！按下【G】键执行抓取。")
+                self.mode = 'ready_to_grasp'
+            else:
+                self.mode = 'normal'
+        else:
+            self.mode = 'ready_to_press' 
+
+    def execute_lift_object(self):
+        """【新增】倒数 2 秒后将物体原路垂直提取"""
+        rospy.loginfo(">> 正在等待夹爪闭合稳固 (2秒)...")
+        self.mode = 'waiting_grasp'
+        rospy.sleep(2.0)
+        
+        rospy.loginfo(">> 夹爪闭合完成，开始尝试垂直提取物体...")
+        self.mode = 'moving_up'
+        
+        current_pose = self.arm.get_current_pose().pose
+        target_pose = Pose()
+        target_pose.position.x = current_pose.position.x
+        target_pose.position.y = current_pose.position.y
+        # 向上提取同样的距离，正好回到刚才末端对准时的高位
+        target_pose.position.z = current_pose.position.z + self.downward_distance
+        target_pose.orientation = current_pose.orientation
+
+        waypoints = [target_pose]
+        (plan, fraction) = self.arm.compute_cartesian_path(waypoints, 0.01, True)
+        
+        if fraction >= 0.95:
+            if self.arm.execute(plan, wait=True):
+                rospy.loginfo(">> 成功提取物体！完整流程结束。")
+                rospy.loginfo(">> 按 R 键可放下物体、张开夹爪并复位机器。")
+                self.mode = 'done'
+            else:
+                rospy.logwarn(">> 提取物体执行失败。")
+                self.mode = 'normal'
+        else:
+            rospy.logwarn(">> 提取直线规划失败。")
+            self.mode = 'normal'
 
     def run(self):
         rate = rospy.Rate(30)
@@ -1793,23 +1959,87 @@ class VisualCentering:
                     cv2.line(display_img, (int(self.cx), 0), (int(self.cx), 480), (0, 255, 0), 1)
                     cv2.line(display_img, (0, int(self.cy)), (640, int(self.cy)), (0, 255, 0), 1)
                 
+                if self.current_grasp_width is not None:
+                    mapped_val = self.calculate_grasp_value(self.current_grasp_width)
+                    cv2.putText(display_img, f"Px: {self.current_grasp_width:.1f} -> Grasp: {mapped_val}", (10, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    
+                depth_status = "ON" if self.use_depth_compensation else "OFF"
+                cv2.putText(display_img, f"Depth Comp: {depth_status}", (10, 90), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                
+                # UI 状态提示更新
+                if self.mode == 'draw':
+                    cv2.putText(display_img, "MODE: DRAW GRASP LINE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    if len(self.click_points) == 1:
+                        cv2.circle(display_img, self.click_points[0], 5, (255, 0, 0), -1)
+                elif self.mode == 'waiting_cam':
+                    cv2.putText(display_img, "WAITING (CAMERA ALIGN)...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
+                elif self.mode == 'moving_cam':
+                    cv2.putText(display_img, "MOVING (CAMERA)...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
+                elif self.mode == 'waiting_gripper':
+                    cv2.putText(display_img, "WAITING (GRIPPER SHIFT)...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                elif self.mode == 'moving_gripper':
+                    cv2.putText(display_img, "MOVING (GRIPPER)...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                elif self.mode == 'ready_to_press':
+                    cv2.putText(display_img, "PRESS 'D' TO PRESS DOWN", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 128, 255), 2)
+                elif self.mode == 'moving_down':
+                    cv2.putText(display_img, "PRESSING DOWN...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 128, 255), 2)
+                elif self.mode == 'ready_to_grasp':
+                    cv2.putText(display_img, "PRESS 'G' TO GRASP", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                elif self.mode == 'waiting_grasp':
+                    cv2.putText(display_img, "WAITING GRIPPER (2s)...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                elif self.mode == 'moving_up':
+                    cv2.putText(display_img, "LIFTING OBJECT...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+                elif self.mode == 'done':
+                    cv2.putText(display_img, "DONE! PRESS 'R' TO RESET", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+
+                if (self.mode == 'draw' or self.mode == 'waiting_cam') and len(self.click_points) == 2:
+                    p1 = self.click_points[0]
+                    p2 = self.click_points[1]
+                    cv2.line(display_img, p1, p2, (0, 255, 255), 2)
+                    c_x = int((p1[0] + p2[0]) / 2)
+                    c_y = int((p1[1] + p2[1]) / 2)
+                    cv2.circle(display_img, (c_x, c_y), 5, (0, 0, 255), -1)
+                    cv2.circle(display_img, p1, 5, (255, 0, 0), -1)
+                    cv2.circle(display_img, p2, 5, (255, 0, 0), -1)
+
                 cv2.imshow("Visual_Centering", display_img)
             
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27: 
                 break
             elif key == ord('r'):
-                rospy.loginfo("回归固定拍照位...")
-                home_thread = threading.Thread(target=self.go_home)
-                home_thread.daemon = True
-                home_thread.start()
-            # [新增] 监听小写 g 键
+                rospy.loginfo("夹爪复位，回归拍照位...")
+                self.send_ble_command(0)
+                self.click_points = []
+                self.current_grasp_width = None
+                self.mode = 'normal'
+                threading.Thread(target=self.go_home, daemon=True).start()
+                
+            elif key == ord('l'):
+                if self.mode in ['normal', 'done']:
+                    self.mode = 'draw'
+                    self.click_points = []
+                    self.current_grasp_width = None
+                else:
+                    rospy.logwarn("流程执行中，请按 R 键重置！")
+                    
+            elif key == ord('d'):
+                if self.mode == 'ready_to_press':
+                    threading.Thread(target=self.execute_downward_press, daemon=True).start()
+                    
             elif key == ord('g'):
-                self.send_ble_random()
+                if self.mode == 'ready_to_grasp' and self.current_grasp_width is not None:
+                    mapped_val = self.calculate_grasp_value(self.current_grasp_width)
+                    if self.send_ble_command(mapped_val):
+                        # 蓝牙发送成功后，启动等待及提取线程
+                        threading.Thread(target=self.execute_lift_object, daemon=True).start()
+                else:
+                    rospy.logwarn("目前无法抓取！")
                 
             rate.sleep()
             
-        # [新增] 退出前关闭串口释放资源，参考 ble_test.py [cite: 20, 21]
         if self.ble_serial and self.ble_serial.is_open:
             self.ble_serial.close()
             rospy.loginfo("[INFO] 蓝牙串口已关闭")
@@ -2247,7 +2477,23 @@ if __name__ == '__main__':
         pass
 ```
 
+## 蓝牙连接操作
 
+遇到需要连接蓝牙串口模块的代码时，先扫描并配对
+
+```
+bluetoothctl
+
+power on
+agent on
+scan on
+# 扫描到设备HC-06D后
+scan off
+pair 00:25:11:20:54:11
+# 输入pin码 1234
+# exit退出后在终端绑定设备
+sudo rfcomm bind 0 00:25:11:20:54:11
+```
 
 ## 纯定位测试指令
 
@@ -2504,7 +2750,284 @@ rotation:
 
 ```
 
+## real_visual_centering.py
 
+```
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import moveit_commander
+import tf2_ros
+import tf.transformations as tf_trans
+import numpy as np
+import cv2
+import math
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import Pose, PoseStamped
+import sys
+import threading
+
+class RealVisualCentering:
+    def __init__(self):
+        moveit_commander.roscpp_initialize(sys.argv)
+        rospy.init_node('real_visual_centering_node')
+
+        # =====================================================================
+        # 【下压安全高度配置】 (可在此处随时修改)
+        # =====================================================================
+        self.target_z_distance = 0.200  # 最终下压至距离桌面多少米 (例如 0.10 代表 10cm)
+
+        # =====================================================================
+        # 【真实机械臂手眼标定参数】
+        # =====================================================================
+        self.calib_x  = -0.015023628963959668
+        self.calib_y  =  0.05162170975609621
+        self.calib_z  =  0.03516081375972209
+        self.calib_qx = 0.002670524858811799
+        self.calib_qy =  0.010239985867424806
+        self.calib_qz = -0.9999343858179239
+        self.calib_qw =  0.004385777621453845
+
+        # 可选微调偏移量
+        self.offset_x = 0.000  
+        self.offset_y = 0.000
+        self.offset_z = 0.000
+        self.offset_roll_deg  = 0.0  
+        self.offset_pitch_deg = 0.0  
+        self.offset_yaw_deg   = 0.0  
+        # =====================================================================
+
+        self.T_tool0_cam = self.get_calibration_matrix()
+
+        # 初始化机械臂与规划场景
+        self.scene = moveit_commander.PlanningSceneInterface()
+        self.arm = moveit_commander.MoveGroupCommander("manipulator")
+        self.arm.set_goal_position_tolerance(0.001)
+        self.arm.set_max_velocity_scaling_factor(0.1)
+        self.arm.set_max_acceleration_scaling_factor(0.1)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        self.base_frame = "base_link"
+        self.tool_frame = "tool0"
+
+        self.bridge = CvBridge()
+        self.color_image = None
+        
+        self.cx = None 
+        self.cy = None 
+        self.fx = None 
+        self.fy = None 
+        self.Zc = None 
+        
+        rospy.Subscriber("/camera/color/camera_info", CameraInfo, self.info_callback)
+        rospy.loginfo("=============================================")
+        rospy.loginfo("正在等待读取相机的真实内参 (fx, fy, cx, cy)...")
+        rospy.loginfo("=============================================")
+        
+        # 初始化姿态并移至拍照点
+        self.home_joints = [0.7854, -1.5708, 1.5708, -1.5708, -1.5708, 3.1416]
+        self.safe_orientation = None
+        
+        rospy.loginfo("正在移动到固定拍照位姿...")
+        self.go_home()
+
+        rospy.sleep(0.5) 
+        self.update_camera_pose()
+
+        # 注入防碰撞虚拟桌面
+        self.add_virtual_table()
+
+        cv2.namedWindow("Real_Visual_Centering")
+        cv2.setMouseCallback("Real_Visual_Centering", self.mouse_click)
+        rospy.Subscriber("/camera/color/image_raw", Image, self.image_callback, queue_size=1, buff_size=2**24)
+        
+        rospy.loginfo("--- 真实机械臂视觉定位与安全下压节点已启动 ---")
+        rospy.loginfo("双击左键：水平对准目标（无下压）")
+        rospy.loginfo("按【D】键：执行严格垂直直线下压，目标距离桌面: %.2fm" % self.target_z_distance)
+        rospy.loginfo("按【R】键：回归拍照位，按【Q】键退出。")
+
+    def add_virtual_table(self):
+        rospy.sleep(1.0)
+        table_pose = PoseStamped()
+        table_pose.header.frame_id = self.base_frame
+        table_pose.pose.position.x = 0.0
+        table_pose.pose.position.y = 0.0
+        table_pose.pose.position.z = -0.005  
+        table_pose.pose.orientation.w = 1.0
+        
+        self.scene.add_box("virtual_table", table_pose, size=(2.0, 2.0, 0.01))
+        rospy.loginfo(">> 已成功向 MoveIt 场景注入防碰撞虚拟桌面")
+
+    def get_calibration_matrix(self):
+        t_base = [self.calib_x, self.calib_y, self.calib_z]
+        q_base = [self.calib_qx, self.calib_qy, self.calib_qz, self.calib_qw]
+        T_base = tf_trans.quaternion_matrix(q_base)
+        T_base[0:3, 3] = t_base
+
+        roll_rad  = math.radians(self.offset_roll_deg)
+        pitch_rad = math.radians(self.offset_pitch_deg)
+        yaw_rad   = math.radians(self.offset_yaw_deg)
+        T_offset = tf_trans.euler_matrix(roll_rad, pitch_rad, yaw_rad, axes='sxyz')
+        T_offset[0:3, 3] = [self.offset_x, self.offset_y, self.offset_z]
+
+        return np.dot(T_base, T_offset)
+
+    def info_callback(self, msg):
+        if self.fx is None:
+            self.fx = msg.K[0]
+            self.cx = msg.K[2]
+            self.fy = msg.K[4]
+            self.cy = msg.K[5]
+
+    def go_home(self):
+        self.arm.set_joint_value_target(self.home_joints)
+        success = self.arm.go(wait=True)
+        self.arm.stop()
+        rospy.sleep(0.2) 
+        
+        current_pose = self.arm.get_current_pose().pose
+        self.safe_orientation = current_pose.orientation
+        return success
+
+    def image_callback(self, msg):
+        try:
+            self.color_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            rospy.logerr("图像转换失败: %s", e)
+
+    def update_camera_pose(self):
+        try:
+            trans = self.tf_buffer.lookup_transform(self.base_frame, self.tool_frame, rospy.Time(0), rospy.Duration(1.0))
+            t = [trans.transform.translation.x, trans.transform.translation.y, trans.transform.translation.z]
+            q = [trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w]
+            
+            T_base_tool0 = tf_trans.quaternion_matrix(q)
+            T_base_tool0[0:3, 3] = t
+            
+            self.T_base_cam = np.dot(T_base_tool0, self.T_tool0_cam)
+            self.Zc = self.T_base_cam[2, 3]
+            return True
+        except Exception as e:
+            rospy.logwarn("无法获取 tool0 TF: %s", e)
+            return False
+
+    def mouse_click(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDBLCLK:
+            rospy.loginfo("检测到点击坐标: u=%d, v=%d (执行水平中心对准)", x, y)
+            move_thread = threading.Thread(target=self.execute_centering, args=(x, y))
+            move_thread.daemon = True
+            move_thread.start()
+
+    def execute_centering(self, target_u, target_v):
+        if self.safe_orientation is None or self.fx is None or not self.update_camera_pose():
+            rospy.logwarn("未能更新相机状态或位姿，取消移动。")
+            return
+
+        delta_u = target_u - self.cx
+        delta_v = target_v - self.cy
+        
+        move_x_cam = (delta_u * self.Zc) / self.fx
+        move_y_cam = (delta_v * self.Zc) / self.fy
+        
+        v_cam = np.array([move_x_cam, move_y_cam, 0.0, 0.0])
+        v_base = np.dot(self.T_base_cam, v_cam)
+
+        current_pose = self.arm.get_current_pose().pose
+        target_pose = Pose()
+        target_pose.position.x = current_pose.position.x + v_base[0]
+        target_pose.position.y = current_pose.position.y + v_base[1]
+        target_pose.position.z = current_pose.position.z 
+        target_pose.orientation = self.safe_orientation 
+
+        rospy.loginfo("正在进行高位水平对准...")
+        self.arm.set_pose_target(target_pose)
+        success = self.arm.go(wait=True)
+        self.arm.stop()
+        self.arm.clear_pose_targets()
+        
+        if success:
+            rospy.loginfo("水平对准完成！如果位置满意，请按【D】键执行垂直下压。")
+
+    def execute_downward(self):
+        """执行笛卡尔直线下压，确保 X、Y 方向无波动"""
+        if self.safe_orientation is None:
+            rospy.logwarn("未获取到安全姿态，拒绝下压。")
+            return
+
+        current_pose = self.arm.get_current_pose().pose
+        
+        # 安全硬件门限：避免已经在低位时重复下压发生危险
+        if current_pose.position.z <= (self.target_z_distance + 0.005):
+            rospy.logwarn("当前末端高度 %.4fm 已接近或低于目标高度 %.4fm，拒绝下压动作！", 
+                          current_pose.position.z, self.target_z_distance)
+            return
+
+        # 构建直线路径的路点 (Waypoints)
+        waypoints = []
+        
+        target_pose = Pose()
+        target_pose.position.x = current_pose.position.x
+        target_pose.position.y = current_pose.position.y
+        target_pose.position.z = self.target_z_distance  # 使用类头部配置的距离参数
+        target_pose.orientation = self.safe_orientation
+        waypoints.append(target_pose)
+
+        rospy.loginfo("=============================================")
+        rospy.loginfo(">> 启动严格垂直下压！当前高度: %.4fm -> 目标高度: %.4fm", current_pose.position.z, self.target_z_distance)
+        rospy.loginfo("=============================================")
+
+        # 计算笛卡尔轨迹
+        # 参数: 路点列表, 步进距离 eef_step (0.01m), 跳跃阈值 jump_threshold (0.0 表示不限制)
+        # 修改后：传入 True 解决 C++ 签名不匹配问题
+        (plan, fraction) = self.arm.compute_cartesian_path(waypoints, 0.01, True)
+
+        # fraction 表示路径规划成功的比例，1.0 表示 100% 成功生成了直线轨迹
+        if fraction >= 0.95:
+            rospy.loginfo("直线路径规划成功，开始执行严格下压...")
+            success = self.arm.execute(plan, wait=True)
+            if success:
+                rospy.loginfo(">> 已成功安全垂直下压至目标位置。")
+            else:
+                rospy.logwarn(">> 下压执行阶段失败。")
+        else:
+            rospy.logwarn(">> 直线规划失败，规划完成度仅为 %.2f%%，可能由于奇异点或碰撞导致路径被截断。", fraction * 100)
+
+    def run(self):
+        rate = rospy.Rate(30)
+        while not rospy.is_shutdown():
+            if self.color_image is not None:
+                display_img = self.color_image.copy()
+                if self.cx is not None and self.cy is not None:
+                    cv2.line(display_img, (int(self.cx), 0), (int(self.cx), 720), (0, 255, 0), 1)
+                    cv2.line(display_img, (0, int(self.cy)), (1280, int(self.cy)), (0, 255, 0), 1)
+                
+                cv2.imshow("Real_Visual_Centering", display_img)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            elif key == ord('r'):
+                rospy.loginfo("回归固定拍照位...")
+                threading.Thread(target=self.go_home, daemon=True).start()
+            elif key == ord('d'):
+                threading.Thread(target=self.execute_downward, daemon=True).start()
+                
+            rate.sleep()
+            
+        cv2.destroyAllWindows()
+        moveit_commander.roscpp_shutdown()
+
+if __name__ == '__main__':
+    try:
+        node = RealVisualCentering()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
+```
 
 ## 真实机械臂纯定位测试指令
 
